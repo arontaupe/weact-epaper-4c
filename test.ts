@@ -1,0 +1,11 @@
+// Runs only in the extension project itself, not in projects that use it.
+epaper.connect(DigitalPin.P0, DigitalPin.P1, DigitalPin.P2, DigitalPin.P3)
+epaper.setRotation(epaper.Rotation.Landscape)
+epaper.clear(epaper.Color.White)
+epaper.fillRect(0, 0, epaper.width(), 20, epaper.Color.Red)
+epaper.drawText("Hallo Calliope!", 6, 6, epaper.Color.White, 1)
+epaper.drawText("4 Farben", 10, 40, epaper.Color.Black, 3)
+epaper.fillCircle(60, 120, 25, epaper.Color.Yellow)
+epaper.drawCircle(120, 120, 25, epaper.Color.Black)
+epaper.drawLine(0, epaper.height() - 1, epaper.width() - 1, 25, epaper.Color.Red)
+epaper.update()

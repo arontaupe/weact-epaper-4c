@@ -1,0 +1,17 @@
+{
+    "name": "weact-epaper-4c",
+    "version": "0.1.0",
+    "description": "Driver for the WeAct 2.9\" 4-color (black/white/red/yellow) SPI e-paper module (JD79667, 168x384) for Calliope mini",
+    "dependencies": {
+        "core": "*"
+    },
+    "files": [
+        "README.md",
+        "epaper.ts",
+        "font.ts"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "public": true
+}

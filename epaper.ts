@@ -35,10 +35,10 @@ namespace epaper {
     const ROW_BYTES = 42            // 168 px / 4 px per byte
     const BUF_SIZE = 16128          // 42 * 384
 
-    let csPin: DigitalPin = DigitalPin.P0
-    let dcPin: DigitalPin = DigitalPin.P1
-    let rstPin: DigitalPin = DigitalPin.P2
-    let busyPin: DigitalPin = DigitalPin.P3
+    let csPin: DigitalPin = DigitalPin.P8
+    let dcPin: DigitalPin = DigitalPin.P9
+    let rstPin: DigitalPin = DigitalPin.P10
+    let busyPin: DigitalPin = DigitalPin.P12
     let rotation = 0
     let buf: Buffer = null
     let ready = false

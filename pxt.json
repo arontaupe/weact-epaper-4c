@@ -10,8 +10,5 @@
         "epaper.ts",
         "font.ts"
     ],
-    "testFiles": [
-        "test.ts"
-    ],
     "public": true
 }

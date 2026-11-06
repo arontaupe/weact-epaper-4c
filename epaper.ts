@@ -189,9 +189,7 @@ namespace epaper {
     }
 
     /** Set one pixel. */
-    //% blockId=epaper_setpixel block="e-paper plot x %x y %y color %color"
-    //% weight=65 group="Draw"
-    export function setPixel(x: number, y: number, color: Color) {
+    function setPixel(x: number, y: number, color: Color) {
         ensureBuffer()
         if (x < 0 || y < 0 || x >= width() || y >= height()) return
         let px = x
@@ -207,91 +205,6 @@ namespace epaper {
             py = NATIVE_H - 1 - x
         }
         putNative(px, py, color)
-    }
-
-    /** Draw a line. */
-    //% blockId=epaper_line block="e-paper line from x %x0 y %y0 to x %x1 y %y1 color %color"
-    //% weight=60 group="Draw"
-    export function drawLine(x0: number, y0: number, x1: number, y1: number, color: Color) {
-        let dx = Math.abs(x1 - x0)
-        let dy = -Math.abs(y1 - y0)
-        let sx = x0 < x1 ? 1 : -1
-        let sy = y0 < y1 ? 1 : -1
-        let err = dx + dy
-        while (true) {
-            setPixel(x0, y0, color)
-            if (x0 == x1 && y0 == y1) break
-            let e2 = 2 * err
-            if (e2 >= dy) {
-                err += dy
-                x0 += sx
-            }
-            if (e2 <= dx) {
-                err += dx
-                y0 += sy
-            }
-        }
-    }
-
-    /** Draw a rectangle outline. */
-    //% blockId=epaper_rect block="e-paper rectangle x %x y %y width %w height %h color %color"
-    //% weight=55 group="Draw"
-    export function drawRect(x: number, y: number, w: number, h: number, color: Color) {
-        if (w <= 0 || h <= 0) return
-        drawLine(x, y, x + w - 1, y, color)
-        drawLine(x, y + h - 1, x + w - 1, y + h - 1, color)
-        drawLine(x, y, x, y + h - 1, color)
-        drawLine(x + w - 1, y, x + w - 1, y + h - 1, color)
-    }
-
-    /** Draw a filled rectangle. */
-    //% blockId=epaper_fillrect block="e-paper filled rectangle x %x y %y width %w height %h color %color"
-    //% weight=54 group="Draw"
-    export function fillRect(x: number, y: number, w: number, h: number, color: Color) {
-        for (let j = 0; j < h; j++) {
-            for (let i = 0; i < w; i++) {
-                setPixel(x + i, y + j, color)
-            }
-        }
-    }
-
-    /** Draw a circle outline around the center (cx, cy). */
-    //% blockId=epaper_circle block="e-paper circle center x %cx y %cy radius %r color %color"
-    //% weight=50 group="Draw"
-    export function drawCircle(cx: number, cy: number, r: number, color: Color) {
-        let x = r
-        let y = 0
-        let err = 1 - r
-        while (x >= y) {
-            setPixel(cx + x, cy + y, color)
-            setPixel(cx + y, cy + x, color)
-            setPixel(cx - y, cy + x, color)
-            setPixel(cx - x, cy + y, color)
-            setPixel(cx - x, cy - y, color)
-            setPixel(cx - y, cy - x, color)
-            setPixel(cx + y, cy - x, color)
-            setPixel(cx + x, cy - y, color)
-            y++
-            if (err < 0) {
-                err += 2 * y + 1
-            } else {
-                x--
-                err += 2 * (y - x) + 1
-            }
-        }
-    }
-
-    /** Draw a filled circle around the center (cx, cy). */
-    //% blockId=epaper_fillcircle block="e-paper filled circle center x %cx y %cy radius %r color %color"
-    //% weight=49 group="Draw"
-    export function fillCircle(cx: number, cy: number, r: number, color: Color) {
-        for (let j = -r; j <= r; j++) {
-            for (let i = -r; i <= r; i++) {
-                if (i * i + j * j <= r * r) {
-                    setPixel(cx + i, cy + j, color)
-                }
-            }
-        }
     }
 
     /**
@@ -319,10 +232,10 @@ namespace epaper {
                 let bits = font5x7.getUint8(base + col)
                 for (let row = 0; row < 7; row++) {
                     if ((bits >> row) & 1) {
-                        if (size == 1) {
-                            setPixel(cx + col, cy + row, color)
-                        } else {
-                            fillRect(cx + col * size, cy + row * size, size, size, color)
+                        for (let sy = 0; sy < size; sy++) {
+                            for (let sx = 0; sx < size; sx++) {
+                                setPixel(cx + col * size + sx, cy + row * size + sy, color)
+                            }
                         }
                     }
                 }

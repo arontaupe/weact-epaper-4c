@@ -8,8 +8,10 @@
     "files": [
         "README.md",
         "epaper.ts",
-        "font.ts",
-        "main.ts"
+        "font.ts"
+    ],
+    "testFiles": [
+        "test.ts"
     ],
     "public": true
 }

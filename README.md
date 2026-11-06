@@ -9,7 +9,7 @@ module (controller JD79667, 168 x 384 px).
 
 ## Requirements
 
-- Calliope mini **2.x or 3** (the frame buffer needs 16 KB of RAM; the mini 1 is too small).
+- Calliope mini **2.x or 3**.
 - The display runs on **3.3 V only**, power and data.
 
 ## Wiring
@@ -53,8 +53,8 @@ epaper.drawText("Hello!", 10, 10, epaper.Color.Red, 3)
 epaper.update()
 ```
 
-Drawing only changes the memory buffer. `refresh display` sends it to the panel
-and takes **20 to 25 seconds**. Do not refresh more often than every few minutes.
+`refresh display` streams the text frame to the panel and takes **20 to 25 seconds**.
+Do not refresh more often than every few minutes.
 
 ## Colors
 

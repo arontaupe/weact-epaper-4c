@@ -1,9 +1,8 @@
 /**
  * WeAct 2.9" 4-color e-paper (black / white / yellow / red), JD79667, 168 x 384 px.
  * Init sequence and data format follow the GxEPD2 driver for GDEY029F51H.
- * Needs a Calliope mini with enough RAM for a 16 KB frame buffer (mini 2 / mini 3).
- * The frame buffer uses one compact 16 KB allocation to avoid the overhead of
- * many smaller MakeCode heap allocations.
+ * Streams a text frame directly over SPI, so it does not allocate a full
+ * 16 KB framebuffer in the MakeCode heap.
  */
 //% color="#2E7D32" weight=60 icon="\uf109" block="E-Paper"
 namespace epaper {
@@ -34,14 +33,17 @@ namespace epaper {
     const NATIVE_H = 384
     const ROW_BYTES = 42 // 168 px / 4 px per byte
 
-    const BUF_SIZE = ROW_BYTES * NATIVE_H // 16128 bytes, 2 bits per pixel
-
     let csPin: DigitalPin = DigitalPin.P0
     let dcPin: DigitalPin = DigitalPin.P1
     let rstPin: DigitalPin = DigitalPin.P2
     let busyPin: DigitalPin = DigitalPin.P3
     let rotation = 0
-    let buf: Buffer = null
+    let background: Color = Color.White
+    let textValue = ""
+    let textX = 0
+    let textY = 0
+    let textColor: Color = Color.Black
+    let textSize = 1
     let ready = false
 
     // ---------------------------------------------------------------- low level
@@ -115,19 +117,50 @@ namespace epaper {
         waitBusy()
     }
 
-    function ensureBuffer() {
-        if (!buf) {
-            buf = control.createBuffer(BUF_SIZE)
-            buf.fill(0x55) // white
+    function textPixel(x: number, y: number): Color {
+        let cx = textX
+        let cy = textY
+        for (let n = 0; n < textValue.length; n++) {
+            let ch = textValue.charCodeAt(n)
+            if (ch == 10) {
+                cx = textX
+                cy += 8 * textSize
+                continue
+            }
+            if (ch < 32 || ch > 126) ch = 63
+            if (x >= cx && x < cx + 5 * textSize && y >= cy && y < cy + 7 * textSize) {
+                let col = (x - cx) / textSize >> 0
+                let row = (y - cy) / textSize >> 0
+                let bits = font5x7.getUint8((ch - 32) * 5 + col)
+                if ((bits >> row) & 1) return textColor
+            }
+            cx += 6 * textSize
         }
+        return background
     }
 
-    function putNative(px: number, py: number, c: number) {
-        let idx = py * ROW_BYTES + (px >> 2)
-        let shift = 6 - 2 * (px & 3)
-        let b = buf.getUint8(idx)
-        b = (b & (255 - (3 << shift))) | (c << shift)
-        buf.setUint8(idx, b)
+    function logicalPixel(nativeX: number, nativeY: number): Color {
+        let x = nativeX
+        let y = nativeY
+        if (rotation == 1) {
+            x = nativeY
+            y = NATIVE_W - 1 - nativeX
+        } else if (rotation == 2) {
+            x = NATIVE_W - 1 - nativeX
+            y = NATIVE_H - 1 - nativeY
+        } else if (rotation == 3) {
+            x = NATIVE_H - 1 - nativeY
+            y = nativeX
+        }
+        return textPixel(x, y)
+    }
+
+    function streamByte(nativeX: number, nativeY: number) {
+        let value = logicalPixel(nativeX, nativeY) << 6
+        value |= logicalPixel(nativeX + 1, nativeY) << 4
+        value |= logicalPixel(nativeX + 2, nativeY) << 2
+        value |= logicalPixel(nativeX + 3, nativeY)
+        pins.spiWrite(value)
     }
 
     // ---------------------------------------------------------------- setup
@@ -151,7 +184,6 @@ namespace epaper {
         pins.digitalWritePin(csPin, 1)
         pins.spiFormat(8, 0)
         pins.spiFrequency(4000000)
-        ensureBuffer()
         ready = true
     }
 
@@ -184,27 +216,7 @@ namespace epaper {
     //% blockId=epaper_clear block="e-paper clear with %color"
     //% weight=70 group="Draw"
     export function clear(color: Color) {
-        ensureBuffer()
-        buf.fill(color * 0x55)
-    }
-
-    /** Set one pixel. */
-    function setPixel(x: number, y: number, color: Color) {
-        ensureBuffer()
-        if (x < 0 || y < 0 || x >= width() || y >= height()) return
-        let px = x
-        let py = y
-        if (rotation == 1) {
-            px = NATIVE_W - 1 - y
-            py = x
-        } else if (rotation == 2) {
-            px = NATIVE_W - 1 - x
-            py = NATIVE_H - 1 - y
-        } else if (rotation == 3) {
-            px = y
-            py = NATIVE_H - 1 - x
-        }
-        putNative(px, py, color)
+        background = color
     }
 
     /**
@@ -217,31 +229,11 @@ namespace epaper {
     //% weight=45 group="Draw"
     export function drawText(text: string, x: number, y: number, color: Color, size: number = 1) {
         if (size < 1) size = 1
-        let cx = x
-        let cy = y
-        for (let n = 0; n < text.length; n++) {
-            let ch = text.charCodeAt(n)
-            if (ch == 10) {
-                cx = x
-                cy += 8 * size
-                continue
-            }
-            if (ch < 32 || ch > 126) ch = 63 // "?"
-            let base = (ch - 32) * 5
-            for (let col = 0; col < 5; col++) {
-                let bits = font5x7.getUint8(base + col)
-                for (let row = 0; row < 7; row++) {
-                    if ((bits >> row) & 1) {
-                        for (let sy = 0; sy < size; sy++) {
-                            for (let sx = 0; sx < size; sx++) {
-                                setPixel(cx + col * size + sx, cy + row * size + sy, color)
-                            }
-                        }
-                    }
-                }
-            }
-            cx += 6 * size
-        }
+        textValue = text
+        textX = x
+        textY = y
+        textColor = color
+        textSize = size
     }
 
     // ---------------------------------------------------------------- output
@@ -254,15 +246,16 @@ namespace epaper {
     //% weight=40 group="Display"
     export function update() {
         if (!ready) return
-        ensureBuffer()
         hwReset()
         initController()
         setWindow(1)
         cmd(0x10)
         pins.digitalWritePin(dcPin, 1)
         pins.digitalWritePin(csPin, 0)
-        for (let i = 0; i < BUF_SIZE; i++) {
-            pins.spiWrite(buf.getUint8(i))
+        for (let y = 0; y < NATIVE_H; y++) {
+            for (let x = 0; x < NATIVE_W; x += 4) {
+                streamByte(x, y)
+            }
         }
         pins.digitalWritePin(csPin, 1)
         setWindow(0)

@@ -1,0 +1,6 @@
+node_modules/
+pxt_modules/
+built/
+package.json
+package-lock.json
+tsconfig.json

@@ -2,8 +2,8 @@
  * WeAct 2.9" 4-color e-paper (black / white / yellow / red), JD79667, 168 x 384 px.
  * Init sequence and data format follow the GxEPD2 driver for GDEY029F51H.
  * Needs a Calliope mini with enough RAM for a 16 KB frame buffer (mini 2 / mini 3).
- * The frame buffer is split into small strips, because one 16 KB allocation
- * fails on the MakeCode heap (error 022).
+ * The frame buffer uses one compact 16 KB allocation to avoid the overhead of
+ * many smaller MakeCode heap allocations.
  */
 //% color="#2E7D32" weight=60 icon="\uf109" block="E-Paper"
 namespace epaper {
@@ -34,17 +34,14 @@ namespace epaper {
     const NATIVE_H = 384
     const ROW_BYTES = 42 // 168 px / 4 px per byte
 
-    // Keep each allocation small enough for the MakeCode heap.
-    const STRIP_ROWS = 8
-    const STRIP_BYTES = ROW_BYTES * STRIP_ROWS // 336
-    const NUM_STRIPS = NATIVE_H / STRIP_ROWS // 48
+    const BUF_SIZE = ROW_BYTES * NATIVE_H // 16128 bytes, 2 bits per pixel
 
     let csPin: DigitalPin = DigitalPin.P0
     let dcPin: DigitalPin = DigitalPin.P1
     let rstPin: DigitalPin = DigitalPin.P2
     let busyPin: DigitalPin = DigitalPin.P3
     let rotation = 0
-    let strips: Buffer[] = null
+    let buf: Buffer = null
     let ready = false
 
     // ---------------------------------------------------------------- low level
@@ -119,23 +116,18 @@ namespace epaper {
     }
 
     function ensureBuffer() {
-        if (!strips) {
-            strips = []
-            for (let i = 0; i < NUM_STRIPS; i++) {
-                let s = control.createBuffer(STRIP_BYTES)
-                s.fill(0x55) // white
-                strips.push(s)
-            }
+        if (!buf) {
+            buf = control.createBuffer(BUF_SIZE)
+            buf.fill(0x55) // white
         }
     }
 
     function putNative(px: number, py: number, c: number) {
-        let s = strips[py >> 3]
-        let idx = (py & 7) * ROW_BYTES + (px >> 2)
+        let idx = py * ROW_BYTES + (px >> 2)
         let shift = 6 - 2 * (px & 3)
-        let b = s.getUint8(idx)
+        let b = buf.getUint8(idx)
         b = (b & (255 - (3 << shift))) | (c << shift)
-        s.setUint8(idx, b)
+        buf.setUint8(idx, b)
     }
 
     // ---------------------------------------------------------------- setup
@@ -193,9 +185,7 @@ namespace epaper {
     //% weight=70 group="Draw"
     export function clear(color: Color) {
         ensureBuffer()
-        for (let i = 0; i < NUM_STRIPS; i++) {
-            strips[i].fill(color * 0x55)
-        }
+        buf.fill(color * 0x55)
     }
 
     /** Set one pixel. */
@@ -358,11 +348,8 @@ namespace epaper {
         cmd(0x10)
         pins.digitalWritePin(dcPin, 1)
         pins.digitalWritePin(csPin, 0)
-        for (let s = 0; s < NUM_STRIPS; s++) {
-            let b = strips[s]
-            for (let i = 0; i < STRIP_BYTES; i++) {
-                pins.spiWrite(b.getUint8(i))
-            }
+        for (let i = 0; i < BUF_SIZE; i++) {
+            pins.spiWrite(buf.getUint8(i))
         }
         pins.digitalWritePin(csPin, 1)
         setWindow(0)

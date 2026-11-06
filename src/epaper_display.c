@@ -30,10 +30,32 @@
 /*----------------------------------------------------------------------------*/
 
 /*
+ * The driver always uses the SPI1 controller. Pins can only be routed to it
+ * from fixed GPIOs: SCK on 10, 14 or 26, and MOSI (TX) on 11, 15 or 27.
+ * (RP2040 and RP2350A; RP2350B's extra GPIOs are not covered here.)
+ */
+static bool epd_spi1_pins_valid(const epd_pin_config_t *pins)
+{
+    const bool sck_ok = pins->sck == 10 || pins->sck == 14 || pins->sck == 26;
+    const bool mosi_ok =
+        pins->mosi == 11 || pins->mosi == 15 || pins->mosi == 27;
+    return sck_ok && mosi_ok;
+}
+
+/*
  * Initialize the SPI pins associated to the specified E-Paper Display context.
  */
 static bool epd_init_spi(const epd_ctx_t *ctx)
 {
+    if (!epd_spi1_pins_valid(&ctx->pins))
+    {
+        EPD_LOG("SCK (%u) / MOSI (%u) are not valid SPI1 pins. "
+                "Use SCK 10/14/26 with MOSI 11/15/27.",
+                (unsigned)ctx->pins.sck,
+                (unsigned)ctx->pins.mosi);
+        return false;
+    }
+
     /*
      * Initialize the SPI1 controller with the specified baud rate.
      */
@@ -72,9 +94,9 @@ static bool epd_init_spi(const epd_ctx_t *ctx)
     gpio_set_dir(ctx->pins.res, GPIO_OUT);
 
     /*
-     * Initialize busy pin. The display sets this pin to high whenever it's
-     * drawing to the screen, since it can not accept data/commands during this
-     * time.
+     * Initialize busy pin. The display holds this pin low whenever it's busy
+     * (refreshing, powering on/off) and releases it high when it can accept
+     * data/commands again. See 'epd_utils_wait_until_idle'.
      */
     gpio_init(ctx->pins.busy);
     gpio_set_dir(ctx->pins.busy, GPIO_IN);
@@ -150,7 +172,21 @@ bool epd_init(epd_ctx_t *ctx,
      * Initialize the specific display model.
      */
     if (!ctx->display_funcs.init_display(ctx))
+    {
+        epd_deinit(ctx);
         return false;
+    }
 
     return true;
+}
+
+void epd_deinit(epd_ctx_t *ctx)
+{
+    if (ctx == NULL)
+        return;
+
+    free(ctx->framebuffer);
+    ctx->framebuffer = NULL;
+    ctx->framebuffer_size = 0;
+    spi_deinit(spi1);
 }

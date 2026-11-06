@@ -158,7 +158,11 @@ static void draw_oriented_pixel(uint16_t x, uint16_t y, uint8_t color, bool land
         epd_draw_pixel(&display, x, y, color);
 }
 
-static void draw_scaled_text(const char *text, uint8_t color, uint8_t background, uint8_t size, bool landscape)
+static void draw_scaled_text(const char *text,
+                             uint8_t color,
+                             uint8_t background,
+                             uint8_t size,
+                             bool landscape)
 {
     if (size < 1)
         size = 1;
@@ -167,57 +171,58 @@ static void draw_scaled_text(const char *text, uint8_t color, uint8_t background
     epd_clear(&display, background);
 
     uint16_t line_count = 1;
-    uint16_t longest = 0;
-    uint16_t current = 0;
     for (const char *p = text; *p; p++)
-    {
         if (*p == '\n')
-        {
-            if (current > longest)
-                longest = current;
-            current = 0;
             line_count++;
-        }
-        else
-        {
-            current++;
-        }
-    }
-    if (current > longest)
-        longest = current;
-    (void)longest;
 
-    uint16_t canvas_width = landscape ? display.height : display.width;
-    uint16_t canvas_height = landscape ? display.width : display.height;
-    uint16_t line_height = 8 * size;
-    uint16_t first_y = line_count * line_height < canvas_height
-                           ? (canvas_height - line_count * line_height) / 2
-                           : 0;
+    const uint16_t canvas_width = landscape ? display.height : display.width;
+    const uint16_t canvas_height = landscape ? display.width : display.height;
+    const uint16_t line_height = FONT_HEIGHT * size;
+    const uint16_t first_y = line_count * line_height < canvas_height
+                                 ? (canvas_height - line_count * line_height) / 2
+                                 : 0;
+
     uint16_t line = 0;
     const char *line_start = text;
     while (line_start && *line_start)
     {
         const char *line_end = strchr(line_start, '\n');
-        size_t length = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-        uint32_t line_width = length * 6 * size;
-        uint16_t x = line_width < canvas_width ? (canvas_width - line_width) / 2 : 0;
-        for (size_t index = 0; index < length; index++)
+        size_t byte_length =
+            line_end ? (size_t)(line_end - line_start) : strlen(line_start);
+        if (byte_length > 0 && line_start[byte_length - 1] == '\r')
+            byte_length--;
+
+        const size_t glyph_count = font_utf8_count(line_start, byte_length);
+        const uint32_t line_width = glyph_count * FONT_ADVANCE * size;
+        uint16_t x =
+            line_width < canvas_width ? (canvas_width - line_width) / 2 : 0;
+
+        const char *p = line_start;
+        const char *stop = line_start + byte_length;
+        while (p < stop)
         {
-            const uint8_t *glyph = font_get_glyph(line_start[index]);
+            uint32_t codepoint;
+            const size_t consumed = font_utf8_decode(p, &codepoint);
+            if (consumed == 0)
+                break;
+            const uint8_t *glyph = font_get_glyph_cp(codepoint);
             for (uint8_t glyph_x = 0; glyph_x < FONT_WIDTH; glyph_x++)
             {
                 for (uint8_t glyph_y = 0; glyph_y < FONT_HEIGHT; glyph_y++)
                 {
-                    if (!(glyph[glyph_x] & (1 << glyph_y)))
+                    if (!(glyph[glyph_x] & (1u << glyph_y)))
                         continue;
                     for (uint8_t sx = 0; sx < size; sx++)
                         for (uint8_t sy = 0; sy < size; sy++)
-                            draw_oriented_pixel(x + glyph_x * size + sx,
-                                                first_y + line * line_height + glyph_y * size + sy,
-                                                color, landscape);
+                            draw_oriented_pixel(
+                                x + glyph_x * size + sx,
+                                first_y + line * line_height + glyph_y * size + sy,
+                                color,
+                                landscape);
                 }
             }
-            x += 6 * size;
+            x += FONT_ADVANCE * size;
+            p += consumed;
         }
         line++;
         line_start = line_end ? line_end + 1 : NULL;
@@ -227,12 +232,13 @@ static void draw_scaled_text(const char *text, uint8_t color, uint8_t background
 
 static void draw_max_text(const char *text, uint8_t background, bool landscape)
 {
-    size_t length = strlen(text);
-    uint16_t canvas_width = landscape ? display.height : display.width;
+    const size_t glyph_count = font_utf8_count(text, strlen(text));
+    const uint16_t canvas_width = landscape ? display.height : display.width;
     uint8_t size = 8;
-    while (size > 1 && length * 6 * size > canvas_width)
+    while (size > 1 && glyph_count * FONT_ADVANCE * size > canvas_width)
         size--;
-    uint8_t color = background == EPD_COLOR_BLACK ? EPD_COLOR_WHITE : EPD_COLOR_BLACK;
+    const uint8_t color =
+        background == EPD_COLOR_BLACK ? EPD_COLOR_WHITE : EPD_COLOR_BLACK;
     draw_scaled_text(text, color, background, size, landscape);
 }
 

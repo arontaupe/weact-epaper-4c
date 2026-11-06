@@ -1,5 +1,19 @@
 # WeAct 2.9-inch 4-Color E-Paper for Pico W
 
+
+License and credits
+
+This project is licensed under the GNU General Public License, version 3 or (at your option) any later version (GPL-3.0-or-later). See LICENSE.
+
+It builds on:
+
+rp2350-epaper by 8dcc (GPL-3.0-or-later), the source of the e-paper driver (epaper_display*.c) and the font table. Copyright 2026 8dcc.
+GxEPD2 by Jean-Marc Zingg (GPL-3.0), origin of the GDEY029F51H / JD79667 init sequence.
+Adafruit-GFX-Library classic 5x7 font (BSD, Copyright (c) 2012 Adafruit Industries).
+
+Changes made in this repository: Pico W web UI and HTTP server (main.c)
+
+
 Firmware for the WeAct Studio 2.9-inch 4-color e-paper display:
 
 - Controller: JD79667 / GDEY029F51H

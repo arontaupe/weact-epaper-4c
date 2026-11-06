@@ -1,6 +1,30 @@
-node_modules/
-pxt_modules/
-built/
-package.json
-package-lock.json
-tsconfig.json
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Pico SDK and local cross-toolchains
+/pico-sdk/
+/arm-gnu-toolchain-*/
+
+# CMake and firmware build output
+/build/
+/cmake-build-*/
+*.uf2
+*.elf
+*.elf.map
+*.bin
+*.hex
+*.dis
+*.a
+
+# macOS and editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+.idea/
+
+# Local logs
+*.log

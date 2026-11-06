@@ -39,10 +39,10 @@ namespace epaper {
     const STRIP_BYTES = ROW_BYTES * STRIP_ROWS // 336
     const NUM_STRIPS = NATIVE_H / STRIP_ROWS // 48
 
-    let csPin: DigitalPin = DigitalPin.P8
-    let dcPin: DigitalPin = DigitalPin.P9
-    let rstPin: DigitalPin = DigitalPin.P10
-    let busyPin: DigitalPin = DigitalPin.P12
+    let csPin: DigitalPin = DigitalPin.P0
+    let dcPin: DigitalPin = DigitalPin.P1
+    let rstPin: DigitalPin = DigitalPin.P2
+    let busyPin: DigitalPin = DigitalPin.P3
     let rotation = 0
     let strips: Buffer[] = null
     let ready = false

@@ -1,5 +1,5 @@
 // Runs only in the extension project itself, not in projects that use it.
-epaper.connect(DigitalPin.P8, DigitalPin.P9, DigitalPin.P10, DigitalPin.P12)
+epaper.connect(DigitalPin.P0, DigitalPin.P1, DigitalPin.P2, DigitalPin.P3)
 epaper.setRotation(epaper.Rotation.Landscape)
 epaper.clear(epaper.Color.White)
 epaper.fillRect(0, 0, epaper.width(), 20, epaper.Color.Red)

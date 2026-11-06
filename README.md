@@ -29,10 +29,10 @@ wire as follows:
 | GND | `GND` | Ground |
 | SCL / CLK | `P13` | SPI clock (`SCK`) |
 | SDA / DIN | `P15` | SPI data from Calliope (`MOSI`) |
-| CS | `P8` | Chip select |
-| D/C | `P9` | Data/command select |
-| RES | `P10` | Display reset |
-| BUSY | `P12` | Display busy status |
+| CS | `P0` | Chip select |
+| D/C | `P1` | Data/command select |
+| RES | `P2` | Display reset |
+| BUSY | `P3` | Display busy status |
 
 `P14` (`MISO`) is not connected because this display is write-only. On the
 Calliope mini header, `SCL` and `SDA` on the e-paper module mean SPI clock and
@@ -46,7 +46,7 @@ If your SPI wires are not on the default SPI pins, set them first with the
 ## Blocks
 
 ```blocks
-epaper.connect(DigitalPin.P8, DigitalPin.P9, DigitalPin.P10, DigitalPin.P12)
+epaper.connect(DigitalPin.P0, DigitalPin.P1, DigitalPin.P2, DigitalPin.P3)
 epaper.setRotation(epaper.Rotation.Landscape)
 epaper.clear(epaper.Color.White)
 epaper.drawText("Hello!", 10, 10, epaper.Color.Red, 3)

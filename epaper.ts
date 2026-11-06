@@ -34,11 +34,10 @@ namespace epaper {
     const NATIVE_H = 384
     const ROW_BYTES = 42 // 168 px / 4 px per byte
 
-    // frame buffer is split into strips of 32 rows (do not change without
-    // also changing the ">> 5" and "& 31" in putNative)
-    const STRIP_ROWS = 32
-    const STRIP_BYTES = ROW_BYTES * STRIP_ROWS // 1344
-    const NUM_STRIPS = NATIVE_H / STRIP_ROWS // 12
+    // Keep each allocation small enough for the MakeCode heap.
+    const STRIP_ROWS = 8
+    const STRIP_BYTES = ROW_BYTES * STRIP_ROWS // 336
+    const NUM_STRIPS = NATIVE_H / STRIP_ROWS // 48
 
     let csPin: DigitalPin = DigitalPin.P8
     let dcPin: DigitalPin = DigitalPin.P9
@@ -131,8 +130,8 @@ namespace epaper {
     }
 
     function putNative(px: number, py: number, c: number) {
-        let s = strips[py >> 5]
-        let idx = (py & 31) * ROW_BYTES + (px >> 2)
+        let s = strips[py >> 3]
+        let idx = (py & 7) * ROW_BYTES + (px >> 2)
         let shift = 6 - 2 * (px & 3)
         let b = s.getUint8(idx)
         b = (b & (255 - (3 << shift))) | (c << shift)

@@ -69,3 +69,5 @@ by Jean-Marc Zingg (GPL-3.0), so check licensing before publishing.
 ## Supported targets
 
 - for PXT/calliope
+
+<https://calliope.cc/media/pages/calliope-mini/technische-daten/b18aad5ac3-1695728195/calliopev3_front.svg>

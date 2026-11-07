@@ -27,6 +27,9 @@
 #include "epaper_display_2in9.h"
 #include "epaper_display_utils.h"
 
+/* Declared here as well, so this file builds even if epaper_display.h lacks it. */
+void epd_deinit(epd_ctx_t *ctx);
+
 /*----------------------------------------------------------------------------*/
 
 /*

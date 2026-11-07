@@ -154,6 +154,8 @@ bool epd_init(epd_ctx_t *ctx,
               const epd_pin_config_t *pin_config,
               enum EEpdModels model);
 
+void epd_deinit(epd_ctx_t *ctx);
+
 /*
  * Reset the display
  */

@@ -23,6 +23,40 @@ pico_sdk_init()
 
 # ------------------------------------------------------------------------------
 
+# Wi-Fi credentials and boot text go into a generated header, not into -D flags.
+# Passing them as compile definitions breaks on ';' and '"' (build error) and
+# silently changes a backslash sequence such as '\n' inside a password.
+# Here every value becomes a C string literal, byte for byte.
+if(NOT DISPLAY_BG MATCHES "^[0-3]$")
+    message(FATAL_ERROR "DISPLAY_BG must be 0 (black), 1 (white), 2 (yellow) or 3 (red)")
+endif()
+if(NOT DISPLAY_ORIENTATION MATCHES "^[01]$")
+    message(FATAL_ERROR "DISPLAY_ORIENTATION must be 0 (portrait) or 1 (landscape)")
+endif()
+
+function(epaper_c_escape out_var value)
+    string(REPLACE "\\" "\\\\" escaped "${value}")
+    string(REPLACE "\"" "\\\"" escaped "${escaped}")
+    string(REPLACE "\r" "" escaped "${escaped}")
+    string(REPLACE "\n" "\\n" escaped "${escaped}")
+    set(${out_var} "${escaped}" PARENT_SCOPE)
+endfunction()
+
+foreach(name
+        WIFI_SSID WIFI_PASSWORD
+        WIFI_SSID_2 WIFI_PASSWORD_2
+        WIFI_SSID_3 WIFI_PASSWORD_3
+        WIFI_SSID_4 WIFI_PASSWORD_4
+        DISPLAY_TEXT)
+    epaper_c_escape(${name}_C "${${name}}")
+endforeach()
+
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/wifi_config.h.in
+               ${CMAKE_BINARY_DIR}/generated/wifi_config.h
+               @ONLY)
+
+# ------------------------------------------------------------------------------
+
 # Build the E-Paper driver as a static library
 add_library(epaper_display STATIC
     src/epaper_display.c
@@ -44,30 +78,18 @@ add_executable(pico_epaper_4color_example
     examples/main.c
 )
 
-# Set include directories, so the example can access the library's headers.
+# Set include directories, so the example can access the library's headers and
+# the generated wifi_config.h.
 target_include_directories(pico_epaper_4color_example PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/examples
+    ${CMAKE_BINARY_DIR}/generated
 )
 
 # Link the example against the library
 target_link_libraries(pico_epaper_4color_example
     epaper_display
     pico_cyw43_arch_lwip_threadsafe_background
-)
-
-target_compile_definitions(pico_epaper_4color_example PRIVATE
-    WIFI_SSID="${WIFI_SSID}"
-    WIFI_PASSWORD="${WIFI_PASSWORD}"
-    WIFI_SSID_2="${WIFI_SSID_2}"
-    WIFI_PASSWORD_2="${WIFI_PASSWORD_2}"
-    WIFI_SSID_3="${WIFI_SSID_3}"
-    WIFI_PASSWORD_3="${WIFI_PASSWORD_3}"
-    WIFI_SSID_4="${WIFI_SSID_4}"
-    WIFI_PASSWORD_4="${WIFI_PASSWORD_4}"
-    DISPLAY_TEXT="${DISPLAY_TEXT}"
-    DISPLAY_BG=${DISPLAY_BG}
-    DISPLAY_ORIENTATION=${DISPLAY_ORIENTATION}
 )
 
 # Enable USB output, disable UART output

@@ -20,6 +20,7 @@
 
 #include "font.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "pico/stdlib.h"
@@ -52,9 +53,23 @@
  */
 static bool panel_asleep = false;
 
+/*
+ * True between POWER_ON (end of the register init) and POWER_OFF (end of
+ * flush). The register init, which ends with POWER_ON, is only re-run when the
+ * panel is off, so a panel that is already on never gets a second POWER_ON.
+ */
+static bool panel_powered = false;
+
 /*----------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------*/
+
+/* Wait for BUSY and log which step it was, so a slow or stuck panel is obvious. */
+static void epd_2in9_wait(const epd_ctx_t *ctx, const char *step)
+{
+    printf("EPD: waiting for %s...\n", step);
+    epd_utils_wait_until_idle(ctx);
+}
 
 /*
  * Send the full register setup and power the panel on. Mirrors the GxEPD2
@@ -111,7 +126,8 @@ static void epd_2in9_init_registers(const epd_ctx_t *ctx, bool hardware_reset)
     epd_utils_send_command(ctx, 0x30);
     epd_utils_send_data(ctx, 0x08);
     epd_utils_send_command(ctx, EPD_CMD_POWER_ON);
-    epd_utils_wait_until_idle(ctx);
+    epd_2in9_wait(ctx, "power on");
+    panel_powered = true;
 }
 
 bool epd_2in9_init_display(const epd_ctx_t *ctx)
@@ -140,9 +156,11 @@ void epd_2in9_flush(const epd_ctx_t *ctx)
 
     /*
      * The panel is powered off after every refresh (see below), so bring it
-     * back up first. After deep sleep this includes a hardware reset.
+     * back up first. After deep sleep this includes a hardware reset. Right
+     * after epd_2in9_init_display() it is still on, so nothing is repeated.
      */
-    epd_2in9_init_registers(ctx, panel_asleep);
+    if (!panel_powered)
+        epd_2in9_init_registers(ctx, panel_asleep);
     panel_asleep = false;
 
     /* RAM window = whole screen, partial-mode flag set while writing data. */
@@ -176,12 +194,13 @@ void epd_2in9_flush(const epd_ctx_t *ctx)
     epd_utils_send_data(ctx, 0x00);
     /* BUSY may take a moment to assert after the refresh command. */
     sleep_ms(EPD_REFRESH_START_DELAY_MS);
-    epd_utils_wait_until_idle(ctx);
+    epd_2in9_wait(ctx, "the refresh (about 20 s)");
 
     /* Power the panel off so the image is not held under bias. */
     epd_utils_send_command(ctx, EPD_CMD_POWER_OFF);
     epd_utils_send_data(ctx, 0x00);
-    epd_utils_wait_until_idle(ctx);
+    epd_2in9_wait(ctx, "power off");
+    panel_powered = false;
 }
 
 /*
@@ -194,6 +213,7 @@ void epd_2in9_sleep(const epd_ctx_t *ctx)
     epd_utils_send_command(ctx, EPD_CMD_DEEP_SLEEP_MODE);
     epd_utils_send_data(ctx, EPD_DEEP_SLEEP_CODE);
     panel_asleep = true;
+    panel_powered = false;
 }
 
 void epd_2in9_clear(const epd_ctx_t *ctx, uint8_t color)

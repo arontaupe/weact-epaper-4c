@@ -54,10 +54,21 @@
 #define HTTP_POLL_INTERVAL 4 /* tcp_poll units of 500 ms: every 2 s */
 #define HTTP_IDLE_POLLS 10   /* close a connection after ~20 s without progress */
 #define MESSAGE_BODY_SIZE 640
+/*
+ * Bytes per tcp_write. lwIP copies the data into its own heap (MEM_SIZE is only
+ * about 4000 bytes by default), so one write of the whole 4.5 KB page fails
+ * with ERR_MEM. Small pieces go through as earlier ones are acknowledged, and
+ * the piece size halves further if lwIP still runs out of memory.
+ */
+#define HTTP_WRITE_CHUNK 1024
+#define HTTP_WRITE_CHUNK_MIN 128
 
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 #define IP_WAIT_TIMEOUT_MS 15000
 #define WIFI_SCAN_TIMEOUT_MS 8000
+#define WIFI_SCAN_PASSES 2
+#define WIFI_BLIND_TIMEOUT_MS 8000 /* networks the scan did not see */
+#define WIFI_LEAVE_PAUSE_MS 200
 #define LINK_CHECK_INTERVAL_US 5000000ULL
 #define LINK_BAD_CHECKS_BEFORE_RECONNECT 3
 #define HEARTBEAT_INTERVAL_US 10000000ULL
@@ -115,6 +126,8 @@ typedef struct
     uint8_t idle_polls;
     bool responding;
     bool in_use;
+    bool warned_memory;
+    size_t chunk_limit; /* current bytes per tcp_write */
 } http_conn_t;
 
 static epd_ctx_t display;
@@ -561,10 +574,27 @@ static err_t http_write_more(http_conn_t *c)
         const size_t room = tcp_sndbuf(c->pcb);
         if (room == 0)
             break;
-        const size_t chunk = available < room ? available : room;
+        size_t chunk = available < room ? available : room;
+        if (chunk > c->chunk_limit)
+            chunk = c->chunk_limit;
         const err_t error = tcp_write(c->pcb, source, (u16_t)chunk, TCP_WRITE_FLAG_COPY);
         if (error == ERR_MEM)
+        {
+            if (!c->warned_memory)
+            {
+                c->warned_memory = true;
+                printf("HTTP: lwIP out of memory writing %u bytes (send buffer %u); "
+                       "sending in smaller pieces\n",
+                       (unsigned)chunk,
+                       (unsigned)room);
+            }
+            if (chunk > HTTP_WRITE_CHUNK_MIN)
+            {
+                c->chunk_limit = chunk / 2 < HTTP_WRITE_CHUNK_MIN ? HTTP_WRITE_CHUNK_MIN : chunk / 2;
+                continue; /* try again right away with less */
+            }
             break; /* retry when ACKs free up memory */
+        }
         if (error != ERR_OK)
             return http_close(c);
         c->sent += chunk;
@@ -581,6 +611,7 @@ static err_t http_respond(http_conn_t *c,
                           const char *body)
 {
     c->responding = true;
+    c->chunk_limit = HTTP_WRITE_CHUNK;
     c->body = body;
     c->body_length = strlen(body);
     const int length = snprintf(c->header,
@@ -872,10 +903,12 @@ static bool wait_for_ip(uint32_t timeout_ms)
     return true;
 }
 
+#define WIFI_NETWORK_COUNT (sizeof(wifi_networks) / sizeof(wifi_networks[0]))
+
 static size_t configured_network_count(void)
 {
     size_t count = 0;
-    for (size_t i = 0; i < sizeof(wifi_networks) / sizeof(wifi_networks[0]); i++)
+    for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++)
         if (wifi_networks[i].ssid[0])
             count++;
     return count;
@@ -900,7 +933,9 @@ static const wifi_auth_mode_t wifi_auth_modes[] = {
 };
 #define WIFI_AUTH_MODE_COUNT (sizeof(wifi_auth_modes) / sizeof(wifi_auth_modes[0]))
 
-/* What the last round learned about one network; shown if joining fails. */
+#define WIFI_NEARBY_MAX 16
+
+/* What a round learned about one network; shown if joining fails. */
 typedef struct
 {
     const char *ssid;
@@ -910,136 +945,412 @@ typedef struct
     uint8_t channel;
     int16_t rssi;
     uint8_t auth_mode;
+    unsigned nearby_count; /* distinct named networks the scan saw */
+    unsigned hidden_count; /* scan results without a name */
+    char similar[33];      /* a nearby SSID that differs only slightly from ours */
     size_t attempts;
     int codes[WIFI_AUTH_MODE_COUNT];
 } wifi_report_t;
 
-static wifi_report_t wifi_report; /* first configured network, latest round */
+static wifi_report_t wifi_report; /* most informative network of the latest round */
 
-/* Static: the driver may still call back after we stop waiting. */
+typedef struct
+{
+    char ssid[33];
+    int16_t rssi;
+    uint8_t channel;
+    uint8_t auth_mode;
+} wifi_nearby_t;
+
+/*
+ * Scan results. Static, because the driver delivers them from its background
+ * context and may call back after we stop waiting; always read under the lwIP
+ * lock.
+ */
 static struct
 {
-    const char *ssid;
-    size_t ssid_length;
     bool seen;
     uint8_t channel;
     int16_t rssi;
     uint8_t auth_mode;
-    unsigned total;
-} wifi_scan;
+} wifi_visibility[WIFI_NETWORK_COUNT];
+static wifi_nearby_t wifi_nearby[WIFI_NEARBY_MAX]; /* strongest first once sorted */
+static unsigned wifi_nearby_count;
+static unsigned wifi_scan_total, wifi_hidden_count; /* best single pass */
+static unsigned wifi_pass_total, wifi_pass_hidden;
+
+static void wifi_nearby_add(const cyw43_ev_scan_result_t *result)
+{
+    char name[33];
+    const size_t length = result->ssid_len > 32 ? 32 : result->ssid_len;
+    memcpy(name, result->ssid, length);
+    name[length] = '\0';
+
+    size_t weakest = 0;
+    for (size_t i = 0; i < wifi_nearby_count; i++)
+    {
+        if (strcmp(wifi_nearby[i].ssid, name) == 0)
+        {
+            if (result->rssi > wifi_nearby[i].rssi)
+            {
+                wifi_nearby[i].rssi = (int16_t)result->rssi;
+                wifi_nearby[i].channel = (uint8_t)result->channel;
+                wifi_nearby[i].auth_mode = (uint8_t)result->auth_mode;
+            }
+            return;
+        }
+        if (wifi_nearby[i].rssi < wifi_nearby[weakest].rssi)
+            weakest = i;
+    }
+    size_t slot;
+    if (wifi_nearby_count < WIFI_NEARBY_MAX)
+        slot = wifi_nearby_count++;
+    else if (result->rssi > wifi_nearby[weakest].rssi)
+        slot = weakest;
+    else
+        return;
+    memcpy(wifi_nearby[slot].ssid, name, sizeof(name));
+    wifi_nearby[slot].rssi = (int16_t)result->rssi;
+    wifi_nearby[slot].channel = (uint8_t)result->channel;
+    wifi_nearby[slot].auth_mode = (uint8_t)result->auth_mode;
+}
 
 static int wifi_scan_result(void *env, const cyw43_ev_scan_result_t *result)
 {
     (void)env;
     if (!result)
         return 0;
-    wifi_scan.total++;
-    if (result->ssid_len == wifi_scan.ssid_length &&
-        memcmp(result->ssid, wifi_scan.ssid, wifi_scan.ssid_length) == 0 &&
-        (!wifi_scan.seen || result->rssi > wifi_scan.rssi))
+    wifi_pass_total++;
+    if (result->ssid_len == 0)
     {
-        wifi_scan.seen = true;
-        wifi_scan.channel = (uint8_t)result->channel;
-        wifi_scan.rssi = (int16_t)result->rssi;
-        wifi_scan.auth_mode = (uint8_t)result->auth_mode;
+        wifi_pass_hidden++; /* hidden networks announce no name */
+        return 0;
+    }
+    wifi_nearby_add(result);
+    for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++)
+    {
+        const char *ssid = wifi_networks[i].ssid;
+        const size_t length = strlen(ssid);
+        if (length == 0 || result->ssid_len != length ||
+            memcmp(result->ssid, ssid, length) != 0)
+            continue;
+        if (!wifi_visibility[i].seen || result->rssi > wifi_visibility[i].rssi)
+        {
+            wifi_visibility[i].seen = true;
+            wifi_visibility[i].channel = (uint8_t)result->channel;
+            wifi_visibility[i].rssi = (int16_t)result->rssi;
+            wifi_visibility[i].auth_mode = (uint8_t)result->auth_mode;
+        }
     }
     return 0;
 }
 
-/* Scan for the SSID. Returns false if the scan itself could not run. */
-static bool wifi_scan_for(const char *ssid)
+/*
+ * Reduce an SSID for comparison: ASCII letters lower-cased, other ASCII
+ * punctuation and spaces dropped, bytes >= 0x80 kept as they are.
+ */
+static size_t wifi_ssid_key(const char *s, char *out, size_t size)
+{
+    size_t n = 0;
+    for (; *s && n + 1 < size; s++)
+    {
+        const unsigned char c = (unsigned char)*s;
+        if (c >= 'A' && c <= 'Z')
+            out[n++] = (char)(c + 32);
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c >= 0x80)
+            out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* True if 'b' is not 'a' but differs only in case, spaces or punctuation, or extends it. */
+static bool wifi_ssid_similar(const char *a, const char *b)
+{
+    if (strcmp(a, b) == 0)
+        return false;
+    char ka[33], kb[33];
+    const size_t na = wifi_ssid_key(a, ka, sizeof(ka));
+    const size_t nb = wifi_ssid_key(b, kb, sizeof(kb));
+    if (na < 3 || nb < 3)
+        return false;
+    if (na == nb)
+        return memcmp(ka, kb, na) == 0;
+    const size_t shorter = na < nb ? na : nb;
+    return shorter >= 4 && memcmp(ka, kb, shorter) == 0;
+}
+
+static void wifi_print_hex(const char *s)
+{
+    for (; *s; s++)
+        printf("%02x ", (unsigned)(unsigned char)*s);
+}
+
+/*
+ * Scan for the configured networks, up to WIFI_SCAN_PASSES times (a single scan
+ * can miss an access point that is there). Returns false if it could not run.
+ * The scan is only used to choose how hard to try a network and to explain
+ * failures; it never rules a network out, because hidden networks do not show
+ * up in scans at all.
+ */
+static bool wifi_scan_all(void)
 {
     cyw43_arch_lwip_begin();
-    memset(&wifi_scan, 0, sizeof(wifi_scan));
-    wifi_scan.ssid = ssid;
-    wifi_scan.ssid_length = strlen(ssid);
+    memset(wifi_visibility, 0, sizeof(wifi_visibility));
+    wifi_nearby_count = 0;
+    wifi_scan_total = 0;
+    wifi_hidden_count = 0;
     cyw43_arch_lwip_end();
 
-    cyw43_wifi_scan_options_t options;
-    memset(&options, 0, sizeof(options));
-    const int error = cyw43_wifi_scan(&cyw43_state, &options, NULL, wifi_scan_result);
-    if (error)
+    bool ran = false;
+    for (int pass = 0; pass < WIFI_SCAN_PASSES; pass++)
     {
-        printf("Wi-Fi: scan failed (%d)\n", error);
+        cyw43_arch_lwip_begin();
+        wifi_pass_total = 0;
+        wifi_pass_hidden = 0;
+        cyw43_arch_lwip_end();
+
+        cyw43_wifi_scan_options_t options;
+        memset(&options, 0, sizeof(options));
+        const int error = cyw43_wifi_scan(&cyw43_state, &options, NULL, wifi_scan_result);
+        if (error)
+        {
+            printf("Wi-Fi: scan failed (%d)\n", error);
+            break;
+        }
+        ran = true;
+        const absolute_time_t deadline = make_timeout_time_ms(WIFI_SCAN_TIMEOUT_MS);
+        while (cyw43_wifi_scan_active(&cyw43_state) && !time_reached(deadline))
+        {
+            cyw43_arch_poll();
+            sleep_ms(50);
+        }
+
+        bool all_seen = true;
+        cyw43_arch_lwip_begin();
+        if (wifi_pass_total > wifi_scan_total)
+            wifi_scan_total = wifi_pass_total;
+        if (wifi_pass_hidden > wifi_hidden_count)
+            wifi_hidden_count = wifi_pass_hidden;
+        for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++)
+            if (wifi_networks[i].ssid[0] && !wifi_visibility[i].seen)
+                all_seen = false;
+        cyw43_arch_lwip_end();
+        if (all_seen)
+            break;
+    }
+    if (!ran)
         return false;
-    }
-    const absolute_time_t deadline = make_timeout_time_ms(WIFI_SCAN_TIMEOUT_MS);
-    while (cyw43_wifi_scan_active(&cyw43_state) && !time_reached(deadline))
+
+    cyw43_arch_lwip_begin();
+    /* strongest first (insertion sort; at most WIFI_NEARBY_MAX entries) */
+    for (size_t i = 1; i < wifi_nearby_count; i++)
     {
-        cyw43_arch_poll();
-        sleep_ms(50);
+        const wifi_nearby_t entry = wifi_nearby[i];
+        size_t j = i;
+        while (j > 0 && wifi_nearby[j - 1].rssi < entry.rssi)
+        {
+            wifi_nearby[j] = wifi_nearby[j - 1];
+            j--;
+        }
+        wifi_nearby[j] = entry;
     }
-    if (wifi_scan.seen)
-        printf("Wi-Fi: scan saw %u networks; \"%s\" on channel %u, %d dBm, security flags %u\n",
-               wifi_scan.total,
-               ssid,
-               (unsigned)wifi_scan.channel,
-               (int)wifi_scan.rssi,
-               (unsigned)wifi_scan.auth_mode);
-    else
-        printf("Wi-Fi: scan saw %u networks, but not \"%s\" "
-               "(2.4 GHz only; check the name, range and channel)\n",
-               wifi_scan.total,
-               ssid);
+    printf("Wi-Fi: scan saw %u results (%u without a name). Strongest named networks:\n",
+           wifi_scan_total,
+           wifi_hidden_count);
+    for (size_t i = 0; i < wifi_nearby_count; i++)
+        printf("Wi-Fi:   %-32s ch%-2u %4d dBm  security flags %u\n",
+               wifi_nearby[i].ssid,
+               (unsigned)wifi_nearby[i].channel,
+               (int)wifi_nearby[i].rssi,
+               (unsigned)wifi_nearby[i].auth_mode);
+    for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++)
+    {
+        if (!wifi_networks[i].ssid[0])
+            continue;
+        if (wifi_visibility[i].seen)
+            printf("Wi-Fi: configured \"%s\": channel %u, %d dBm\n",
+                   wifi_networks[i].ssid,
+                   (unsigned)wifi_visibility[i].channel,
+                   (int)wifi_visibility[i].rssi);
+        else
+        {
+            printf("Wi-Fi: configured \"%s\" is NOT in the scan (hidden, 5 GHz-only, out of range, "
+                   "or the name differs). Its bytes: ",
+                   wifi_networks[i].ssid);
+            wifi_print_hex(wifi_networks[i].ssid);
+            printf("\n");
+        }
+    }
+    cyw43_arch_lwip_end();
     return true;
 }
 
-static bool wifi_try_network(const wifi_network_t *network, wifi_report_t *report)
+static void wifi_report_init(wifi_report_t *report, size_t index, bool scanned)
 {
-    const bool open = network->password[0] == '\0';
     memset(report, 0, sizeof(*report));
-    report->ssid = network->ssid;
-    report->password_length = strlen(network->password);
+    report->ssid = wifi_networks[index].ssid;
+    report->password_length = strlen(wifi_networks[index].password);
+    report->scanned = scanned;
+    if (!scanned)
+        return;
+    cyw43_arch_lwip_begin();
+    report->nearby_count = wifi_nearby_count;
+    report->hidden_count = wifi_hidden_count;
+    if (wifi_visibility[index].seen)
+    {
+        report->seen = true;
+        report->channel = wifi_visibility[index].channel;
+        report->rssi = wifi_visibility[index].rssi;
+        report->auth_mode = wifi_visibility[index].auth_mode;
+    }
+    else
+    {
+        for (size_t i = 0; i < wifi_nearby_count; i++)
+        {
+            if (wifi_ssid_similar(wifi_networks[index].ssid, wifi_nearby[i].ssid))
+            {
+                memcpy(report->similar, wifi_nearby[i].ssid, sizeof(report->similar));
+                printf("Wi-Fi: \"%s\" is nearly the same as the configured \"%s\" (bytes: ",
+                       wifi_nearby[i].ssid,
+                       wifi_networks[index].ssid);
+                wifi_print_hex(wifi_nearby[i].ssid);
+                printf(")\n");
+                break;
+            }
+        }
+    }
+    cyw43_arch_lwip_end();
+}
+
+static const char *wifi_error_name(int code)
+{
+    switch (code)
+    {
+    case PICO_ERROR_TIMEOUT:
+        return "timeout";
+    case PICO_ERROR_GENERIC:
+        return "join failed";
+    case PICO_ERROR_BADAUTH:
+        return "bad auth";
+    case PICO_ERROR_CONNECT_FAILED:
+        return "connect failed";
+    default:
+        return "error";
+    }
+}
+
+/*
+ * Try up to 'mode_limit' security modes for one network. With
+ * 'stop_if_unreachable', give up on the other modes as soon as the network does
+ * not answer at all (timeout or "no such network"): they cannot help then. A
+ * network that answers but rejects the join (hidden, or another security mode)
+ * gets every mode.
+ */
+static bool wifi_try_network(size_t index,
+                             size_t mode_limit,
+                             uint32_t timeout_ms,
+                             bool stop_if_unreachable,
+                             wifi_report_t *report)
+{
+    const wifi_network_t *network = &wifi_networks[index];
+    const bool open = network->password[0] == '\0';
+    const size_t modes = open ? 1 : mode_limit;
     printf("Wi-Fi: \"%s\" (password length %u)\n",
            network->ssid,
            (unsigned)report->password_length);
 
-    report->scanned = wifi_scan_for(network->ssid);
-    cyw43_arch_lwip_begin(); /* scan results arrive from the background context */
-    if (report->scanned && wifi_scan.seen)
-    {
-        report->seen = true;
-        report->channel = wifi_scan.channel;
-        report->rssi = wifi_scan.rssi;
-        report->auth_mode = wifi_scan.auth_mode;
-    }
-    cyw43_arch_lwip_end();
-
-    const size_t mode_count = open ? 1 : WIFI_AUTH_MODE_COUNT;
-    for (size_t i = 0; i < mode_count; i++)
+    for (size_t i = 0; i < modes; i++)
     {
         const uint32_t auth = open ? CYW43_AUTH_OPEN : wifi_auth_modes[i].auth;
         const char *name = open ? "open" : wifi_auth_modes[i].name;
-        printf("Wi-Fi:   trying %s...\n", name);
+        printf("Wi-Fi:   trying %s (up to %u s)...\n", name, (unsigned)(timeout_ms / 1000));
         const int result = cyw43_arch_wifi_connect_timeout_ms(
-            network->ssid, network->password, auth, WIFI_CONNECT_TIMEOUT_MS);
-        report->codes[i] = result;
-        report->attempts = i + 1;
+            network->ssid, network->password, auth, timeout_ms);
         if (result == 0)
         {
+            report->codes[i] = result;
+            report->attempts = i + 1;
             printf("Wi-Fi: joined \"%s\" using %s\n", network->ssid, name);
             return true;
         }
-        printf("Wi-Fi:   %s failed (%d)\n", name, result);
-        if (report->scanned && !report->seen)
-            break; /* not in range: other security modes cannot help */
+        const int link = sta_link_status(); /* join state at the moment of failure */
+        report->codes[i] = result;
+        report->attempts = i + 1;
+        printf("Wi-Fi:   %s failed: %s (%d, link status %d)\n",
+               name,
+               wifi_error_name(result),
+               result,
+               link);
+        /*
+         * A timed-out join stays pending inside the chip and can make the next
+         * attempt fail. Other failures have already ended the join, so those
+         * are left alone.
+         */
+        if (result == PICO_ERROR_TIMEOUT)
+        {
+            cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+            sleep_ms(WIFI_LEAVE_PAUSE_MS);
+        }
+        if (stop_if_unreachable && (result == PICO_ERROR_TIMEOUT || link == CYW43_LINK_NONET))
+        {
+            printf("Wi-Fi:   no answer from \"%s\"; not trying other security modes\n",
+                   network->ssid);
+            break;
+        }
     }
     return false;
 }
 
-/* One pass over all configured networks. Fills 'first_report' for the first. */
-static bool wifi_try_round(wifi_report_t *first_report)
+/* Higher = more useful to show on the panel: seen and tried beats the rest. */
+static int wifi_report_score(const wifi_report_t *report)
 {
-    bool first = true;
-    for (size_t i = 0; i < sizeof(wifi_networks) / sizeof(wifi_networks[0]); i++)
+    return (report->seen ? 2 : 0) + (report->attempts > 0 ? 1 : 0);
+}
+
+/*
+ * One pass over the configured networks, strictly in list order. A network the
+ * scan saw gets every security mode and the full timeout. One the scan did not
+ * see (it may be hidden, or just missed) gets a shorter timeout; if it does not
+ * answer at all that is a single quick attempt, so an absent entry delays the
+ * next one by a few seconds, but if it answers and rejects the join, every
+ * security mode is tried. If the scan itself failed, every network gets the
+ * full treatment. 'best' receives the report worth showing if the round fails.
+ */
+static bool wifi_try_round(wifi_report_t *best)
+{
+    const bool scanned = wifi_scan_all();
+
+    bool have_best = false;
+    for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++)
     {
         if (!wifi_networks[i].ssid[0])
             continue;
-        wifi_report_t scratch;
-        wifi_report_t *report = first ? first_report : &scratch;
-        first = false;
-        if (wifi_try_network(&wifi_networks[i], report))
+        wifi_report_t report;
+        wifi_report_init(&report, i, scanned);
+
+        const bool blind = scanned && !report.seen;
+        const uint32_t timeout_ms = blind ? WIFI_BLIND_TIMEOUT_MS : WIFI_CONNECT_TIMEOUT_MS;
+        if (wifi_try_network(i, WIFI_AUTH_MODE_COUNT, timeout_ms, blind, &report))
             return true;
+
+        /* End whatever the failed attempts left behind before the next network. */
+        bool more_networks = false;
+        for (size_t j = i + 1; j < WIFI_NETWORK_COUNT; j++)
+            if (wifi_networks[j].ssid[0])
+                more_networks = true;
+        if (more_networks && report.attempts > 0 &&
+            report.codes[report.attempts - 1] != PICO_ERROR_TIMEOUT)
+        {
+            cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+            sleep_ms(WIFI_LEAVE_PAUSE_MS);
+        }
+
+        if (!have_best || wifi_report_score(&report) > wifi_report_score(best))
+        {
+            *best = report;
+            have_best = true;
+        }
     }
     return false;
 }
@@ -1054,20 +1365,31 @@ static void wifi_failure_text(const wifi_report_t *report,
     if (!report->scanned)
         snprintf(seen, sizeof(seen), "scan failed");
     else if (!report->seen)
-        snprintf(seen, sizeof(seen), "NOT SEEN (2.4 GHz?)");
+        snprintf(seen, sizeof(seen), "not in scan (hidden?)");
     else
         snprintf(seen, sizeof(seen), "ch%u %ddBm sec%u",
                  (unsigned)report->channel, (int)report->rssi, (unsigned)report->auth_mode);
 
     char codes[48] = "";
+    if (report->attempts == 0)
+        snprintf(codes, sizeof(codes), "none");
     size_t used = 0;
     for (size_t i = 0; i < report->attempts && used + 8 < sizeof(codes); i++)
         used += (size_t)snprintf(codes + used, sizeof(codes) - used, i ? " %d" : "%d",
                                  report->codes[i]);
 
-    int length = snprintf(out, size, "No Wi-Fi\n%.26s\npw length %u\n%s\nerr %s",
+    char scan_line[40] = "";
+    if (report->scanned)
+        snprintf(scan_line, sizeof(scan_line), "\nscan %u nets, %u hidden",
+                 report->nearby_count, report->hidden_count);
+    char similar_line[48] = "";
+    if (report->similar[0])
+        snprintf(similar_line, sizeof(similar_line), "\nsimilar: %.18s", report->similar);
+
+    int length = snprintf(out, size, "No Wi-Fi\n%.26s\npw length %u\n%s\nerr %s%s%s",
                           report->ssid ? report->ssid : "?",
-                          (unsigned)report->password_length, seen, codes);
+                          (unsigned)report->password_length, seen, codes,
+                          scan_line, similar_line);
     if (other_networks > 0 && length > 0 && (size_t)length < size)
         snprintf(out + length, size - (size_t)length, "\n+%u more", (unsigned)other_networks);
 }
@@ -1104,7 +1426,7 @@ static void connect_to_wifi(bool at_boot)
                "5 GHz-only network, weak signal. Retrying...\n");
         if (at_boot)
         {
-            char text[200];
+            char text[260];
             wifi_failure_text(&wifi_report, configured_network_count() - 1, text, sizeof(text));
             show_boot_status_once(text);
         }

@@ -56,10 +56,13 @@ void epd_utils_send_data_buffer(const epd_ctx_t *ctx,
 
 /*
  * The panel holds BUSY low while it is working and releases it (high) when it
- * is ready for commands. A full refresh takes about 21 s, so the default
- * timeout leaves headroom without hanging forever on a wiring fault.
+ * is ready for commands. A full refresh of the 4-color panel takes 20 s or
+ * more (longer when cold), so the default timeout leaves generous headroom
+ * without hanging forever on a wiring fault. Override with -DEPD_BUSY_TIMEOUT_MS.
  */
-#define EPD_BUSY_TIMEOUT_MS 30000
+#ifndef EPD_BUSY_TIMEOUT_MS
+#define EPD_BUSY_TIMEOUT_MS 60000
+#endif
 #define EPD_BUSY_POLL_MS 10
 
 /*
@@ -79,19 +82,23 @@ __attribute__((weak)) void epd_idle_hook(void)
 bool epd_utils_wait_until_idle_timeout(const epd_ctx_t *ctx,
                                        uint32_t timeout_ms)
 {
+    const absolute_time_t start = get_absolute_time();
     const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (gpio_get(ctx->pins.busy) == 0)
     {
         if (time_reached(deadline))
         {
-            printf("EPD: timed out waiting for BUSY after %u ms "
-                   "(check wiring, 3.3 V supply and BUSY pin).\n",
+            printf("EPD: BUSY still low after %u ms: giving up "
+                   "(check wiring, 3.3 V supply and the BUSY pin).\n",
                    (unsigned)timeout_ms);
             return false;
         }
         epd_idle_hook();
         sleep_ms(EPD_BUSY_POLL_MS);
     }
+    const int64_t waited_ms = absolute_time_diff_us(start, get_absolute_time()) / 1000;
+    if (waited_ms >= 200)
+        printf("EPD: BUSY was low for %d ms\n", (int)waited_ms);
     return true;
 }
 

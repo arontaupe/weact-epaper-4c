@@ -1,9 +1,9 @@
 /*
  * WeAct 2.9" 4-color e-paper, Pico W web UI.
  *
- * Boot order: Wi-Fi first, then the HTTP server, then the display. The panel
- * takes about 25 s per refresh, so nothing that the web UI depends on waits for
- * it.
+ * Boot order: Wi-Fi first (own access point if no network can be joined), then
+ * the HTTP server, then the display. The panel takes about 25 s per refresh, so
+ * nothing that the web UI depends on waits for it.
  *
  * Built for pico_cyw43_arch_lwip_threadsafe_background: lwIP and its callbacks
  * (everything in the "HTTP server" section) run in a background context,
@@ -15,6 +15,14 @@
  *     reachable while the panel updates.
  * With the poll variant, cyw43_arch_poll() in the loop and in epd_idle_hook()
  * does the servicing instead; the locks are then no-ops.
+ *
+ * Fallback access point: if no configured network can be joined, the Pico opens
+ * its own Wi-Fi (AP_SSID / AP_PASSWORD) with a DHCP server, and the same web UI
+ * is served at http://192.168.4.1/. While in AP mode it retries the real
+ * network now and then, but only when nobody has used the web UI for a while.
+ *
+ * Text syntax (like the {{ matrix }} shortcode): "|" starts a new line, "\|" is
+ * a literal "|". Lines are word-wrapped to the width of the panel.
  */
 
 #include <stdbool.h>
@@ -30,6 +38,7 @@
 #include "lwip/netif.h"
 #include "lwip/tcp.h"
 
+#include "dhcpserver.h"
 #include "epaper_display.h"
 #include "font.h"
 
@@ -56,9 +65,9 @@
 #define MESSAGE_BODY_SIZE 640
 /*
  * Bytes per tcp_write. lwIP copies the data into its own heap (MEM_SIZE is only
- * about 4000 bytes by default), so one write of the whole 4.5 KB page fails
- * with ERR_MEM. Small pieces go through as earlier ones are acknowledged, and
- * the piece size halves further if lwIP still runs out of memory.
+ * about 4000 bytes by default), so one write of the whole page fails with
+ * ERR_MEM. Small pieces go through as earlier ones are acknowledged, and the
+ * piece size halves further if lwIP still runs out of memory.
  */
 #define HTTP_WRITE_CHUNK 1024
 #define HTTP_WRITE_CHUNK_MIN 128
@@ -67,11 +76,28 @@
 #define IP_WAIT_TIMEOUT_MS 15000
 #define WIFI_SCAN_TIMEOUT_MS 8000
 #define WIFI_SCAN_PASSES 2
-#define WIFI_BLIND_TIMEOUT_MS 8000 /* networks the scan did not see */
+#define WIFI_BLIND_TIMEOUT_MS 20000 /* networks the scan did not see */
 #define WIFI_LEAVE_PAUSE_MS 200
 #define LINK_CHECK_INTERVAL_US 5000000ULL
 #define LINK_BAD_CHECKS_BEFORE_RECONNECT 3
 #define HEARTBEAT_INTERVAL_US 10000000ULL
+
+/* Rounds over all configured networks before giving up and opening the AP. */
+#ifndef WIFI_ROUNDS_BEFORE_AP
+#define WIFI_ROUNDS_BEFORE_AP 1
+#endif
+
+/* Fallback access point. The password needs at least 8 characters (WPA2). */
+#ifndef AP_SSID
+#define AP_SSID "epaper-setup"
+#endif
+#ifndef AP_PASSWORD
+#define AP_PASSWORD "epaper1234"
+#endif
+#define AP_IP_TEXT "192.168.4.1"
+/* In AP mode: retry the real network every 10 min, if the web UI was idle for 5 min. */
+#define AP_RETRY_INTERVAL_US (10ULL * 60 * 1000000ULL)
+#define AP_IDLE_BEFORE_RETRY_MS (5UL * 60 * 1000UL)
 
 /* The panel needs rest between refreshes (vendors recommend >= 180 s). */
 #ifndef RENDER_MIN_INTERVAL_S
@@ -90,8 +116,9 @@
 #define DISPLAY_BG EPD_COLOR_WHITE
 #endif
 
+/* Landscape is the default everywhere. Set DISPLAY_ORIENTATION to 0 for portrait. */
 #ifndef DISPLAY_ORIENTATION
-#define DISPLAY_ORIENTATION 0
+#define DISPLAY_ORIENTATION 1
 #endif
 
 #ifndef WIFI_SSID_2
@@ -103,12 +130,31 @@
 #define WIFI_PASSWORD_4 ""
 #endif
 
+/*
+ * Frame colours use the same numbers as the text colours in the form
+ * (0 black, 1 white, 2 yellow, 3 red); 4 means no frame.
+ */
+#define FRAME_NONE 4
+#ifndef DEFAULT_FRAME
+#define DEFAULT_FRAME 3
+#endif
+#define FRAME_OUTER 8  /* thick outer band, in pixels */
+#define FRAME_GAP 5    /* space between the band and the thin inner line */
+#define FRAME_LINE 2   /* thin inner line */
+#define FRAME_INSET 20 /* text keeps this distance from the edge when framed */
+
+#define MAX_TEXT_LINES 40
+#define LINE_GAP_CELLS 1 /* blank font rows between lines, like the matrix display */
+
 typedef struct
 {
     char text[TEXT_SIZE];
     uint8_t text_color;
     uint8_t background;
-    uint8_t size;
+    uint8_t size;  /* 1..8, 0 = largest size that fits */
+    uint8_t frame; /* 0..3 colour, FRAME_NONE */
+    uint8_t align; /* 0 left, 1 center, 2 right */
+    bool dots;     /* dot-matrix look: every font pixel becomes a separate dot */
     bool landscape;
 } render_params_t;
 
@@ -134,6 +180,9 @@ static epd_ctx_t display;
 static bool display_ready;
 static bool display_init_failed;
 static bool wifi_ready;
+static bool ap_mode;
+static dhcp_server_t dhcp_server;
+static volatile uint32_t last_http_ms; /* 32 bit: written by callbacks, read by the loop */
 
 static volatile bool render_pending;
 static volatile bool rendering;
@@ -158,6 +207,11 @@ static const wifi_network_t wifi_networks[] = {
     {WIFI_SSID_4, WIFI_PASSWORD_4},
 };
 
+/*
+ * The preview mirrors the C layout code: FONT_ADVANCE (F), FONT_HEIGHT (H),
+ * LINE_GAP_CELLS (G), FRAME_* and the word wrap. Keep the numbers in the script
+ * in sync if you change them. The dot-matrix style is not drawn in the preview.
+ */
 static const char page[] =
     "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>WeAct E-Paper</title><style>"
@@ -167,15 +221,16 @@ static const char page[] =
     ".layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,360px);gap:44px;align-items:start}.controls{max-width:480px}"
     "label{display:block;margin:18px 0 7px;font-size:12px;text-transform:uppercase;letter-spacing:.1em}"
     "textarea,select{width:100%;font:inherit;border:1px solid #171717;border-radius:0;padding:11px;background:#fffdf8;color:#171717}textarea{height:150px;resize:vertical}"
-    ".preview-label{font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 10px}.preview-area{display:flex;justify-content:center;background:#e8dfd1;padding:20px;min-height:300px}"
-    ".screen{width:100%;max-width:300px;aspect-ratio:168/384;border:8px solid #171717;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;transition:aspect-ratio .2s}.screen.landscape{aspect-ratio:384/168;max-width:100%}"
-    ".screen-text{white-space:pre-wrap;overflow-wrap:anywhere;text-align:center;line-height:1.15;font-family:monospace;font-weight:700;max-width:96%;word-break:break-word}"
+    ".preview-label{font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 10px}.preview-area{display:flex;justify-content:center;background:#e8dfd1;padding:20px;min-height:200px}"
+    ".screen{width:100%;max-width:300px;aspect-ratio:168/384;outline:8px solid #171717;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden}.screen.landscape{aspect-ratio:384/168;max-width:100%}"
+    ".screen-text{display:block;white-space:pre;overflow:hidden;font-family:'Courier New',monospace;font-weight:700}"
     "button{margin-top:24px;width:100%;padding:13px;border:0;border-radius:0;background:#d84b35;color:#fff;font:700 14px Arial,sans-serif;text-transform:uppercase;letter-spacing:.1em;cursor:pointer}button:hover{background:#b93725}"
     "small{display:block;margin-top:14px;color:#665f56;line-height:1.5}@media(max-width:700px){.layout{grid-template-columns:1fr;gap:30px}header{align-items:start;flex-direction:column;gap:8px}.preview-area{order:-1}}"
     "</style></head><body><main><header><h1>WeAct E-Paper</h1><span>Studio UMZU / prototype</span></header><div class=layout><section class=controls><form method=post action=/render accept-charset=utf-8>"
     "<label for=text>Text</label><textarea id=text name=text maxlength=150 placeholder='Type something...'></textarea>"
+    "<small>Use | for a new line and \\| for a literal |. Long lines wrap.</small>"
     "<label for=orientation>Orientation</label><select id=orientation name=orientation>"
-    "<option value=0 selected>Portrait</option><option value=1>Landscape</option></select>"
+    "<option value=1 selected>Landscape</option><option value=0>Portrait</option></select>"
     "<label for=color>Text color</label><select id=color name=color>"
     "<option value=0 selected>Black</option>"
     "<option value=1>White</option>"
@@ -183,8 +238,9 @@ static const char page[] =
     "<option value=3>Red</option>"
     "</select>"
     "<label for=size>Text size</label><select id=size name=size>"
+    "<option value=0 selected>Auto (as large as fits)</option>"
     "<option value=1>1 - Tiny (8px)</option>"
-    "<option value=2 selected>2 - Small (16px)</option>"
+    "<option value=2>2 - Small (16px)</option>"
     "<option value=3>3 - Medium (24px)</option>"
     "<option value=4>4 - Large (32px)</option>"
     "<option value=5>5 - X-Large (40px)</option>"
@@ -192,14 +248,32 @@ static const char page[] =
     "<option value=7>7 - Huge (56px)</option>"
     "<option value=8>8 - Max (64px)</option>"
     "</select>"
+    "<label for=align>Alignment</label><select id=align name=align>"
+    "<option value=0>Left</option><option value=1 selected>Center</option><option value=2>Right</option></select>"
+    "<label for=style>Style</label><select id=style name=style>"
+    "<option value=0 selected>Solid</option><option value=1>Dot matrix</option></select>"
     "<label for=bg>Background</label><select id=bg name=bg>"
     "<option value=1 selected>White</option><option value=0>Black</option><option value=2>Yellow</option><option value=3>Red</option></select>"
+    "<label for=frame>Frame</label><select id=frame name=frame>"
+    "<option value=3 selected>Red</option><option value=0>Black</option><option value=1>White</option><option value=2>Yellow</option><option value=4>None</option></select>"
     "<button type=submit>Flash display</button></form><small>Preview locally, then send a full refresh to the panel.</small></section>"
-    "<section><p class=preview-label>Preview</p><div class=preview-area><div id=screen class=screen><span id=screen-text></span></div></div></section></div></main>"
-    "<script>const palette=['#171717','#fffdf8','#e7c84b','#d84b35'];"
-    "const text=document.getElementById('text'),color=document.getElementById('color'),size=document.getElementById('size'),bg=document.getElementById('bg'),orientation=document.getElementById('orientation'),screen=document.getElementById('screen'),screenText=document.getElementById('screen-text');"
-    "function update(){const landscape=orientation.value==='1';screen.classList.toggle('landscape',landscape);screen.style.background=palette[bg.value];screenText.style.color=palette[color.value];screenText.style.fontSize=(Number(size.value)*5)+'px';screenText.textContent=text.value||'Preview';}"
-    "[text,color,size,bg,orientation].forEach(x=>x.addEventListener('input',update));update();</script></body></html>";
+    "<section><p class=preview-label>Preview</p><div class=preview-area><div id=screen class='screen landscape'><span id=screen-text class=screen-text></span></div></div></section></div></main>"
+    "<script>const palette=['#171717','#fffdf8','#e7c84b','#d84b35'];const F=6,H=8,G=1,INSET=20,FO=8,FG=5,FL=2;"
+    "const $=id=>document.getElementById(id);const text=$('text'),color=$('color'),size=$('size'),bg=$('bg'),orientation=$('orientation'),frameSel=$('frame'),alignSel=$('align'),styleSel=$('style'),screen=$('screen'),screenText=$('screen-text');"
+    "function brk(t){let o='';for(let i=0;i<t.length;i++){const c=t[i];if(c==='\\\\'&&t[i+1]==='|'){o+='|';i++}else if(c==='|')o+='\\n';else o+=c}return o}"
+    "function wrap(t,max){const out=[];t.split('\\n').forEach(p=>{const before=out.length;let line='';p.split(' ').filter(Boolean).forEach(w=>{let g=[...w];while(g.length>max){if(line){out.push(line);line=''}out.push(g.slice(0,max).join(''));g=g.slice(max)}w=g.join('');"
+    "if(!w)return;if(!line)line=w;else if([...line].length+1+g.length>max){out.push(line);line=w}else line+=' '+w});if(line)out.push(line);if(out.length===before)out.push('')});return out}"
+    "function update(){const land=orientation.value==='1';screen.classList.toggle('landscape',land);"
+    "const cw=land?384:168,ch=land?168:384,k=screen.clientWidth/cw,fr=Number(frameSel.value),ins=fr<4?INSET:0,aw=cw-2*ins,ah=ch-2*ins;"
+    "const t=brk(text.value||'Preview');let s=Number(size.value);"
+    "if(!s){for(s=8;s>1;s--){const n=wrap(t,Math.max(1,Math.floor(aw/(F*s)))).length;if(n*(H+G)*s-G*s<=ah)break}}"
+    "const lines=wrap(t,Math.max(1,Math.floor(aw/(F*s)))),fit=Math.max(1,Math.floor((ah+G*s)/((H+G)*s)));"
+    "screenText.textContent=lines.slice(0,fit).join('\\n');"
+    "screenText.style.width=(aw*k)+'px';screenText.style.fontSize=(F*s*k/0.6)+'px';screenText.style.lineHeight=((H+G)*s*k)+'px';"
+    "screenText.style.textAlign=['left','center','right'][alignSel.value];screenText.style.color=palette[color.value];"
+    "screen.style.background=palette[bg.value];"
+    "if(fr<4&&fr!==Number(bg.value)){const f=palette[fr];screen.style.boxShadow='inset 0 0 0 '+(FO*k)+'px '+f+',inset 0 0 0 '+((FO+FG)*k)+'px '+palette[bg.value]+',inset 0 0 0 '+((FO+FG+FL)*k)+'px '+f}else screen.style.boxShadow='none';}"
+    "[text,color,size,bg,orientation,frameSel,alignSel,styleSel].forEach(x=>x.addEventListener('input',update));addEventListener('resize',update);update();</script></body></html>";
 
 /*----------------------------------------------------------------------------*/
 /* Failure and diagnostics                                                     */
@@ -326,15 +400,168 @@ static bool read_choice(const char *body,
     return true;
 }
 
+/*
+ * Line syntax of the {{ matrix }} shortcode: "|" becomes a line break, "\|"
+ * a literal "|". Works in place (the result is never longer).
+ */
+static void apply_line_syntax(char *s)
+{
+    char *out = s;
+    for (const char *in = s; *in; in++)
+    {
+        if (*in == '\\' && in[1] == '|')
+        {
+            *out++ = '|';
+            in++;
+        }
+        else if (*in == '|')
+            *out++ = '\n';
+        else
+            *out++ = *in;
+    }
+    *out = '\0';
+}
+
 static bool params_equal(const render_params_t *a, const render_params_t *b)
 {
     return a->text_color == b->text_color && a->background == b->background &&
-           a->size == b->size && a->landscape == b->landscape &&
-           strcmp(a->text, b->text) == 0;
+           a->size == b->size && a->landscape == b->landscape && a->frame == b->frame &&
+           a->align == b->align && a->dots == b->dots && strcmp(a->text, b->text) == 0;
+}
+
+/* Defaults for text that comes from firmware, not from the form. */
+static void fill_params(render_params_t *p, const char *text, uint8_t color, uint8_t background)
+{
+    memset(p, 0, sizeof(*p));
+    snprintf(p->text, sizeof(p->text), "%s", text);
+    trim_partial_utf8(p->text);
+    p->text_color = color;
+    p->background = background;
+    p->size = 0; /* as large as fits */
+    p->frame = DEFAULT_FRAME;
+    p->align = 1;
+    p->dots = false;
+    p->landscape = DISPLAY_ORIENTATION != 0;
 }
 
 /*----------------------------------------------------------------------------*/
-/* Rendering                                                                   */
+/* Text layout and rendering                                                   */
+
+typedef struct
+{
+    const char *start;
+    size_t bytes;
+    size_t glyphs;
+} text_line_t;
+
+/*
+ * Greedy word wrap at 'max_glyphs' characters. Explicit line breaks ('\n') are
+ * kept, words longer than a line are split. Returns the number of lines.
+ */
+static size_t wrap_text(const char *text, size_t max_glyphs, text_line_t *lines, size_t max_lines)
+{
+    size_t n = 0;
+    const char *p = text;
+    for (;;)
+    {
+        const char *eol = strchr(p, '\n');
+        const char *para_end = eol ? eol : p + strlen(p);
+        if (para_end > p && para_end[-1] == '\r')
+            para_end--;
+        const size_t before = n;
+        const char *cur = p;
+        while (cur < para_end && n < max_lines)
+        {
+            while (cur < para_end && *cur == ' ')
+                cur++;
+            if (cur >= para_end)
+                break;
+            const char *line_start = cur;
+            const char *line_end = cur;
+            size_t line_glyphs = 0;
+            const char *w = cur;
+            while (w < para_end)
+            {
+                const char *ws = w;
+                while (ws < para_end && *ws == ' ')
+                    ws++;
+                const char *we = ws;
+                while (we < para_end && *we != ' ')
+                    we++;
+                if (we == ws)
+                {
+                    w = we;
+                    break;
+                }
+                const size_t spaces = line_glyphs ? (size_t)(ws - w) : 0;
+                const size_t word_glyphs = font_utf8_count(ws, (size_t)(we - ws));
+                if (line_glyphs && line_glyphs + spaces + word_glyphs > max_glyphs)
+                    break;
+                if (!line_glyphs && word_glyphs > max_glyphs)
+                {
+                    /* a word longer than the line: cut it */
+                    const char *q = ws;
+                    size_t g = 0;
+                    while (g < max_glyphs && q < we)
+                    {
+                        uint32_t codepoint;
+                        const size_t used = font_utf8_decode(q, &codepoint);
+                        if (used == 0)
+                            break;
+                        q += used;
+                        g++;
+                    }
+                    if (q == ws)
+                        q = ws + 1; /* never stand still */
+                    line_end = q;
+                    line_glyphs = g ? g : 1;
+                    w = q;
+                    break;
+                }
+                line_glyphs += spaces + word_glyphs;
+                line_end = we;
+                w = we;
+            }
+            lines[n].start = line_start;
+            lines[n].bytes = (size_t)(line_end - line_start);
+            lines[n].glyphs = line_glyphs;
+            n++;
+            cur = w;
+        }
+        if (n == before && n < max_lines) /* empty paragraph = blank line */
+        {
+            lines[n].start = p;
+            lines[n].bytes = 0;
+            lines[n].glyphs = 0;
+            n++;
+        }
+        if (!eol || n >= max_lines)
+            break;
+        p = eol + 1;
+    }
+    return n;
+}
+
+static size_t layout_text(const char *text, uint16_t avail_w, uint8_t size, text_line_t *lines)
+{
+    size_t max_glyphs = avail_w / (FONT_ADVANCE * size);
+    if (max_glyphs == 0)
+        max_glyphs = 1;
+    return wrap_text(text, max_glyphs, lines, MAX_TEXT_LINES);
+}
+
+/* Largest size (8..1) at which the wrapped text fits into the box. */
+static uint8_t fit_size(const char *text, uint16_t avail_w, uint16_t avail_h, text_line_t *lines)
+{
+    for (uint8_t size = 8; size > 1; size--)
+    {
+        const size_t n = layout_text(text, avail_w, size, lines);
+        const uint32_t block_h = n * (FONT_HEIGHT + LINE_GAP_CELLS) * size - LINE_GAP_CELLS * size;
+        if (block_h <= avail_h)
+            return size;
+    }
+    return 1;
+}
 
 static void draw_oriented_pixel(uint16_t x, uint16_t y, uint8_t color, bool landscape)
 {
@@ -344,47 +571,77 @@ static void draw_oriented_pixel(uint16_t x, uint16_t y, uint8_t color, bool land
         epd_draw_pixel(&display, x, y, color);
 }
 
-static void draw_scaled_text(const char *text,
-                             uint8_t color,
-                             uint8_t background,
-                             uint8_t size,
-                             bool landscape)
+static void fill_rect(int x0, int y0, int w, int h, uint8_t color, bool landscape)
 {
-    if (size < 1)
-        size = 1;
-    if (size > 8)
-        size = 8;
-    epd_clear(&display, background);
+    for (int y = y0; y < y0 + h; y++)
+        for (int x = x0; x < x0 + w; x++)
+            draw_oriented_pixel((uint16_t)x, (uint16_t)y, color, landscape);
+}
 
-    uint16_t line_count = 1;
-    for (const char *p = text; *p; p++)
-        if (*p == '\n')
-            line_count++;
+/* A thick outer band and, set in a little, a thin line. */
+static void draw_frame(uint8_t color, int cw, int ch, bool landscape)
+{
+    fill_rect(0, 0, cw, FRAME_OUTER, color, landscape);
+    fill_rect(0, ch - FRAME_OUTER, cw, FRAME_OUTER, color, landscape);
+    fill_rect(0, FRAME_OUTER, FRAME_OUTER, ch - 2 * FRAME_OUTER, color, landscape);
+    fill_rect(cw - FRAME_OUTER, FRAME_OUTER, FRAME_OUTER, ch - 2 * FRAME_OUTER, color, landscape);
 
+    const int o = FRAME_OUTER + FRAME_GAP;
+    fill_rect(o, o, cw - 2 * o, FRAME_LINE, color, landscape);
+    fill_rect(o, ch - o - FRAME_LINE, cw - 2 * o, FRAME_LINE, color, landscape);
+    fill_rect(o, o + FRAME_LINE, FRAME_LINE, ch - 2 * o - 2 * FRAME_LINE, color, landscape);
+    fill_rect(cw - o - FRAME_LINE, o + FRAME_LINE, FRAME_LINE, ch - 2 * o - 2 * FRAME_LINE,
+              color, landscape);
+}
+
+static void draw_scaled_text(const render_params_t *job)
+{
+    static text_line_t lines[MAX_TEXT_LINES]; /* static: keeps the stack small */
+    const bool landscape = job->landscape;
     const uint16_t canvas_width = landscape ? display.height : display.width;
     const uint16_t canvas_height = landscape ? display.width : display.height;
-    const uint16_t line_height = FONT_HEIGHT * size;
-    const uint16_t first_y = line_count * line_height < canvas_height
-                                 ? (canvas_height - line_count * line_height) / 2
-                                 : 0;
+    const bool framed = job->frame != FRAME_NONE && job->frame != job->background;
+    const uint16_t inset = job->frame != FRAME_NONE ? FRAME_INSET : 0;
+    const uint16_t avail_w = canvas_width - 2 * inset;
+    const uint16_t avail_h = canvas_height - 2 * inset;
 
-    uint16_t line = 0;
-    const char *line_start = text;
-    while (line_start && *line_start)
+    epd_clear(&display, job->background);
+    if (framed)
+        draw_frame(job->frame, canvas_width, canvas_height, landscape);
+
+    uint8_t size = job->size;
+    if (size == 0)
+        size = fit_size(job->text, avail_w, avail_h, lines);
+    if (size > 8)
+        size = 8;
+
+    size_t line_count = layout_text(job->text, avail_w, size, lines);
+    const uint16_t line_height = (FONT_HEIGHT + LINE_GAP_CELLS) * size;
+    size_t fit = (avail_h + LINE_GAP_CELLS * size) / line_height;
+    if (fit == 0)
+        fit = 1;
+    if (line_count > fit)
+        line_count = fit; /* cut off, like the matrix display */
+    const uint16_t block_height = line_count * line_height - LINE_GAP_CELLS * size;
+    const uint16_t first_y = inset + (avail_h > block_height ? (avail_h - block_height) / 2 : 0);
+
+    /* Dot-matrix look: smaller dots with a gap, like the cells in the logo. */
+    const uint8_t gap = job->dots ? (size < 2 ? 0 : size < 7 ? 1
+                                                             : 2)
+                                  : 0;
+    const uint8_t dot = size - gap;
+
+    for (size_t line = 0; line < line_count; line++)
     {
-        const char *line_end = strchr(line_start, '\n');
-        size_t byte_length =
-            line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-        if (byte_length > 0 && line_start[byte_length - 1] == '\r')
-            byte_length--;
+        const uint32_t advance_total = (uint32_t)lines[line].glyphs * FONT_ADVANCE * size;
+        const uint32_t line_width =
+            lines[line].glyphs ? advance_total - (FONT_ADVANCE - FONT_WIDTH) * size : 0;
+        const uint32_t room = line_width < avail_w ? avail_w - line_width : 0;
+        uint16_t x = inset + (job->align == 0 ? 0 : job->align == 2 ? room
+                                                                    : room / 2);
 
-        const size_t glyph_count = font_utf8_count(line_start, byte_length);
-        const uint32_t line_width = glyph_count * FONT_ADVANCE * size;
-        uint16_t x =
-            line_width < canvas_width ? (canvas_width - line_width) / 2 : 0;
-
-        const char *p = line_start;
-        const char *stop = line_start + byte_length;
+        const char *p = lines[line].start;
+        const char *stop = p + lines[line].bytes;
         while (p < stop)
         {
             uint32_t codepoint;
@@ -398,34 +655,20 @@ static void draw_scaled_text(const char *text,
                 {
                     if (!(glyph[glyph_x] & (1u << glyph_y)))
                         continue;
-                    for (uint8_t sx = 0; sx < size; sx++)
-                        for (uint8_t sy = 0; sy < size; sy++)
+                    for (uint8_t sx = 0; sx < dot; sx++)
+                        for (uint8_t sy = 0; sy < dot; sy++)
                             draw_oriented_pixel(
                                 x + glyph_x * size + sx,
                                 first_y + line * line_height + glyph_y * size + sy,
-                                color,
+                                job->text_color,
                                 landscape);
                 }
             }
             x += FONT_ADVANCE * size;
             p += consumed;
         }
-        line++;
-        line_start = line_end ? line_end + 1 : NULL;
     }
     epd_flush(&display);
-}
-
-static void draw_max_text(const char *text, uint8_t background, bool landscape)
-{
-    const size_t glyph_count = font_utf8_count(text, strlen(text));
-    const uint16_t canvas_width = landscape ? display.height : display.width;
-    uint8_t size = 8;
-    while (size > 1 && glyph_count * FONT_ADVANCE * size > canvas_width)
-        size--;
-    const uint8_t color =
-        background == EPD_COLOR_BLACK ? EPD_COLOR_WHITE : EPD_COLOR_BLACK;
-    draw_scaled_text(text, color, background, size, landscape);
 }
 
 /*
@@ -508,7 +751,7 @@ static bool service_render(uint64_t now)
     if (!take_render_job(&job, now))
         return false;
     printf("Display: refreshing (%u bytes of text)\n", (unsigned)strlen(job.text));
-    draw_scaled_text(job.text, job.text_color, job.background, job.size, job.landscape);
+    draw_scaled_text(&job);
     finish_render(&job);
     printf("Display: refresh done\n");
     return true;
@@ -663,19 +906,26 @@ static err_t handle_render(http_conn_t *c, const char *body)
     render_params_t job;
     memset(&job, 0, sizeof(job));
 
-    unsigned color, size, background, orientation;
+    unsigned color, size, background, orientation, frame, align, style;
     if (!read_choice(body, "color", 0, 3, &color) ||
-        !read_choice(body, "size", 2, 8, &size) || size < 1 ||
+        !read_choice(body, "size", 0, 8, &size) ||
         !read_choice(body, "bg", 1, 3, &background) ||
-        !read_choice(body, "orientation", 0, 1, &orientation))
+        !read_choice(body, "orientation", DISPLAY_ORIENTATION != 0, 1, &orientation) ||
+        !read_choice(body, "frame", DEFAULT_FRAME, FRAME_NONE, &frame) ||
+        !read_choice(body, "align", 1, 2, &align) ||
+        !read_choice(body, "style", 0, 1, &style))
         return http_respond_message(c, "400 Bad Request", "Invalid form values.");
 
     if (!form_value(body, "text", job.text, sizeof(job.text)))
         job.text[0] = '\0';
     trim_partial_utf8(job.text);
+    apply_line_syntax(job.text);
     job.text_color = (uint8_t)color;
     job.size = (uint8_t)size;
     job.background = (uint8_t)background;
+    job.frame = (uint8_t)frame;
+    job.align = (uint8_t)align;
+    job.dots = style != 0;
     job.landscape = orientation != 0;
 
     if (job.text_color == job.background)
@@ -841,6 +1091,7 @@ static err_t http_accept(void *arg, struct tcp_pcb *client, err_t error)
     (void)arg;
     if (error != ERR_OK || !client)
         return ERR_VAL;
+    last_http_ms = to_ms_since_boot(get_absolute_time());
     http_conn_t *c = http_conn_alloc();
     if (!c)
     {
@@ -887,10 +1138,14 @@ static bool sta_has_ip(void)
     return has_ip;
 }
 
-static void sta_ip_string(char *buffer, size_t size)
+/* Address of the interface that is in use: the AP in fallback mode, else the station. */
+static void net_ip_string(char *buffer, size_t size)
 {
     cyw43_arch_lwip_begin();
-    ip4addr_ntoa_r(netif_ip4_addr(&cyw43_state.netif[CYW43_ITF_STA]), buffer, (int)size);
+    ip4addr_ntoa_r(
+        netif_ip4_addr(&cyw43_state.netif[ap_mode ? CYW43_ITF_AP : CYW43_ITF_STA]),
+        buffer,
+        (int)size);
     cyw43_arch_lwip_end();
 }
 
@@ -1304,7 +1559,12 @@ static bool wifi_try_network(size_t index,
             cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
             sleep_ms(WIFI_LEAVE_PAUSE_MS);
         }
-        if (stop_if_unreachable && (result == PICO_ERROR_TIMEOUT || link == CYW43_LINK_NONET))
+        /*
+         * "Unreachable" only if the chip never even joined. A timeout with link
+         * status JOIN/NOIP means it joined but the IP address took too long.
+         */
+        if (stop_if_unreachable &&
+            (link == CYW43_LINK_NONET || (result == PICO_ERROR_TIMEOUT && link <= CYW43_LINK_DOWN)))
         {
             printf("Wi-Fi:   no answer from \"%s\"; not trying other security modes\n",
                    network->ssid);
@@ -1407,24 +1667,18 @@ static void wifi_failure_text(const wifi_report_t *report,
 }
 
 /*
- * Show a short message on the panel, once per boot, so a headless device tells
- * you why it is not reachable.
+ * Try the configured networks for up to 'max_rounds' rounds. Returns false if
+ * none could be joined (or none is configured); wifi_report then says why.
  */
-static void show_boot_status_once(const char *message)
-{
-    static bool shown_once;
-    if (shown_once || !ensure_display())
-        return;
-    shown_once = true;
-    draw_scaled_text(message, EPD_COLOR_BLACK, EPD_COLOR_WHITE, 1, false);
-}
-
-static void connect_to_wifi(bool at_boot)
+static bool connect_to_wifi(unsigned max_rounds)
 {
     if (configured_network_count() == 0)
-        fatal("no Wi-Fi network configured (set WIFI_SSID in .env)");
+    {
+        printf("Wi-Fi: no network configured (set WIFI_SSID in .env)\n");
+        return false;
+    }
 
-    while (true)
+    for (unsigned round = 1; round <= max_rounds; round++)
     {
         if (wifi_try_round(&wifi_report))
         {
@@ -1432,20 +1686,92 @@ static void connect_to_wifi(bool at_boot)
             /* Default power saving makes a server slow to answer. */
             cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
 #endif
-            return;
+            return true;
         }
-        printf("Wi-Fi: no network connected. Common causes: wrong password, "
-               "5 GHz-only network, weak signal. Retrying...\n");
-        if (at_boot)
-        {
-            char text[260];
-            wifi_failure_text(&wifi_report, configured_network_count() - 1, text, sizeof(text));
-            show_boot_status_once(text);
-        }
+        printf("Wi-Fi: no network connected (round %u of %u). Common causes: wrong password, "
+               "5 GHz-only network, weak signal.\n",
+               round,
+               max_rounds);
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
         sleep_ms(1000);
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     }
+    return false;
+}
+
+/*----------------------------------------------------------------------------*/
+/* Fallback access point                                                       */
+
+static void start_ap(void)
+{
+    printf("AP: no Wi-Fi, opening \"%s\" (password \"%s\")\n", AP_SSID, AP_PASSWORD);
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    cyw43_arch_disable_sta_mode();
+    cyw43_arch_enable_ap_mode(AP_SSID, AP_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
+
+    ip_addr_t gateway, mask;
+    IP4_ADDR(ip_2_ip4(&gateway), 192, 168, 4, 1);
+    IP4_ADDR(ip_2_ip4(&mask), 255, 255, 255, 0);
+    cyw43_arch_lwip_begin();
+    dhcp_server_init(&dhcp_server, &cyw43_state.netif[CYW43_ITF_AP], &gateway, &mask);
+    cyw43_arch_lwip_end();
+
+    ap_mode = true;
+    last_http_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static void stop_ap(void)
+{
+    cyw43_arch_lwip_begin();
+    dhcp_server_deinit(&dhcp_server);
+    cyw43_arch_lwip_end();
+    cyw43_arch_disable_ap_mode();
+    cyw43_arch_enable_sta_mode();
+    ap_mode = false;
+}
+
+/* What the panel shows after boot or after the network mode changed. */
+static void build_status_text(char *out, size_t size)
+{
+    char ip[IP4ADDR_STRLEN_MAX];
+    net_ip_string(ip, sizeof(ip));
+    if (!ap_mode)
+    {
+        snprintf(out, size, "Web UI:\nhttp://%s/", ip);
+        return;
+    }
+    char diag[260];
+    diag[0] = '\0';
+    if (wifi_report.ssid)
+        wifi_failure_text(&wifi_report, configured_network_count() > 1 ? configured_network_count() - 1 : 0,
+                          diag, sizeof(diag));
+    snprintf(out, size, "Setup mode: join Wi-Fi\n%s / %s\nthen open http://%s/\n\n%s",
+             AP_SSID, AP_PASSWORD, ip, diag);
+}
+
+/* Draws the status screen now (boot: the panel has not been used yet). */
+static void show_status_now(void)
+{
+    static char text[400];
+    static render_params_t job;
+    if (!ensure_display())
+        return;
+    build_status_text(text, sizeof(text));
+    fill_params(&job, text, EPD_COLOR_BLACK, EPD_COLOR_WHITE);
+    draw_scaled_text(&job);
+}
+
+/* Queues the status screen behind the rest period (later mode changes). */
+static void queue_status_screen(void)
+{
+    static char text[400];
+    static render_params_t job;
+    build_status_text(text, sizeof(text));
+    fill_params(&job, text, EPD_COLOR_BLACK, EPD_COLOR_WHITE);
+    cyw43_arch_lwip_begin();
+    pending = job;
+    render_pending = true;
+    cyw43_arch_lwip_end();
 }
 
 /*----------------------------------------------------------------------------*/
@@ -1466,32 +1792,42 @@ int main(void)
     netif_set_hostname(&cyw43_state.netif[CYW43_ITF_STA], EPAPER_HOSTNAME);
     cyw43_arch_lwip_end();
 #endif
-    connect_to_wifi(true);
-    if (!wait_for_ip(IP_WAIT_TIMEOUT_MS))
-        printf("Wi-Fi: joined, but no IP address yet (DHCP slow?)\n");
+    if (connect_to_wifi(WIFI_ROUNDS_BEFORE_AP))
+    {
+        if (!wait_for_ip(IP_WAIT_TIMEOUT_MS))
+            printf("Wi-Fi: joined, but no IP address yet (DHCP slow?)\n");
+    }
+    else
+        start_ap();
+
     char ip_text[IP4ADDR_STRLEN_MAX];
-    sta_ip_string(ip_text, sizeof(ip_text));
+    net_ip_string(ip_text, sizeof(ip_text));
 
     if (!start_server())
         fatal("HTTP server failed to start");
-    printf("Web UI is up: http://%s/\n", ip_text);
+    printf("Web UI is up: http://%s/ (%s)\n", ip_text, ap_mode ? "own access point" : "Wi-Fi");
 
     /* Only now the slow part. The server keeps answering during refreshes. */
-    if (ensure_display())
+    if (DISPLAY_TEXT[0] && !ap_mode)
     {
-        if (DISPLAY_TEXT[0])
-            draw_max_text(DISPLAY_TEXT, DISPLAY_BG, DISPLAY_ORIENTATION != 0);
-        else
+        if (ensure_display())
         {
-            char ip_message[64];
-            snprintf(ip_message, sizeof(ip_message), "Web UI:\n%s", ip_text);
-            draw_scaled_text(ip_message, EPD_COLOR_BLACK, EPD_COLOR_WHITE, 1, false);
+            static render_params_t boot_job;
+            fill_params(&boot_job,
+                        DISPLAY_TEXT,
+                        DISPLAY_BG == EPD_COLOR_BLACK ? EPD_COLOR_WHITE : EPD_COLOR_BLACK,
+                        DISPLAY_BG);
+            apply_line_syntax(boot_job.text);
+            draw_scaled_text(&boot_job);
         }
     }
+    else
+        show_status_now(); /* the IP address, or how to join the setup Wi-Fi */
 
     uint64_t now = time_us_64();
     uint64_t next_led_toggle = now + 500000;
     uint64_t next_link_check = now + LINK_CHECK_INTERVAL_US;
+    uint64_t next_ap_retry = now + AP_RETRY_INTERVAL_US;
     uint64_t next_heartbeat = now + HEARTBEAT_INTERVAL_US;
     bool led_state = true;
     int bad_link_checks = 0;
@@ -1509,7 +1845,7 @@ int main(void)
             next_led_toggle = now + 500000;
         }
 
-        if (now >= next_link_check)
+        if (!ap_mode && now >= next_link_check)
         {
             next_link_check = now + LINK_CHECK_INTERVAL_US;
             if (sta_link_status() == CYW43_LINK_UP)
@@ -1517,19 +1853,45 @@ int main(void)
             else if (++bad_link_checks >= LINK_BAD_CHECKS_BEFORE_RECONNECT)
             {
                 printf("Wi-Fi: link lost, reconnecting\n");
-                connect_to_wifi(false);
-                wait_for_ip(IP_WAIT_TIMEOUT_MS);
                 bad_link_checks = 0;
+                if (connect_to_wifi(WIFI_ROUNDS_BEFORE_AP))
+                    wait_for_ip(IP_WAIT_TIMEOUT_MS);
+                else
+                {
+                    start_ap();
+                    queue_status_screen();
+                    next_ap_retry = time_us_64() + AP_RETRY_INTERVAL_US;
+                }
+            }
+        }
+        else if (ap_mode && now >= next_ap_retry)
+        {
+            next_ap_retry = now + AP_RETRY_INTERVAL_US;
+            const uint32_t idle_ms = to_ms_since_boot(get_absolute_time()) - last_http_ms;
+            if (idle_ms >= AP_IDLE_BEFORE_RETRY_MS)
+            {
+                printf("AP: web UI idle, trying the Wi-Fi again\n");
+                stop_ap();
+                if (connect_to_wifi(1))
+                {
+                    wait_for_ip(IP_WAIT_TIMEOUT_MS);
+                    queue_status_screen();
+                    bad_link_checks = 0;
+                }
+                else
+                    start_ap(); /* same screen as before, no redraw */
+                next_ap_retry = time_us_64() + AP_RETRY_INTERVAL_US;
             }
         }
 
         if (now >= next_heartbeat)
         {
             next_heartbeat = now + HEARTBEAT_INTERVAL_US;
-            sta_ip_string(ip_text, sizeof(ip_text));
-            printf("alive: ip=%s link=%d connections=%d display=%s pending=%d\n",
+            net_ip_string(ip_text, sizeof(ip_text));
+            printf("alive: mode=%s ip=%s link=%d connections=%d display=%s pending=%d\n",
+                   ap_mode ? "ap" : "sta",
                    ip_text,
-                   sta_link_status(),
+                   ap_mode ? -1 : sta_link_status(),
                    connection_count,
                    display_ready ? "ok" : "none",
                    render_pending ? 1 : 0);

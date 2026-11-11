@@ -7,6 +7,7 @@
 #
 # Settings come from .env (KEY=VALUE per line; read as data, never executed):
 #   WIFI_SSID, WIFI_PASSWORD, WIFI_SSID_2..4, WIFI_PASSWORD_2..4
+#   AP_SSID, AP_PASSWORD   (optional: fallback access point when no Wi-Fi works)
 #   PICO_SDK_PATH, PICO_TOOLCHAIN_PATH, PICO_BOARD, PICO_PLATFORM   (optional)
 # Real environment variables work for the PICO_* settings; .env wins for Wi-Fi.
 set -euo pipefail
@@ -35,7 +36,7 @@ Usage: ./flash.sh [options]
 
   --text WORD, --word WORD   text to show on boot (instead of the IP address)
   --bg COLOR                 boot background: black, white, yellow or red
-  --orientation MODE         boot orientation: portrait or landscape
+  --orientation MODE         boot orientation: portrait or landscape (default: landscape)
   --clean                    delete the build directory first
   --build-only               build, do not flash
   --bootsel                  skip picotool, flash via the BOOTSEL drive
@@ -46,6 +47,10 @@ Usage: ./flash.sh [options]
 Wi-Fi settings live in .env, for example:
   WIFI_SSID=My Network
   WIFI_PASSWORD='pass word with $pecial \ characters'
+
+Fallback access point (used when none of the networks can be joined):
+  AP_SSID=epaper-setup
+  AP_PASSWORD=epaper1234        (8 to 63 characters)
 EOF
 }
 
@@ -53,7 +58,7 @@ EOF
 
 INITIAL_TEXT=""
 INITIAL_BG=1
-INITIAL_ORIENTATION=0
+INITIAL_ORIENTATION=1
 CLEAN=0
 BUILD_ONLY=0
 FORCE_BOOTSEL=0
@@ -139,7 +144,7 @@ load_env() {
             fi
         fi
         case "$key" in
-            WIFI_SSID|WIFI_PASSWORD|WIFI_SSID_[234]|WIFI_PASSWORD_[234]|PICO_SDK_PATH|PICO_TOOLCHAIN_PATH|PICO_BOARD|PICO_PLATFORM)
+            WIFI_SSID|WIFI_PASSWORD|WIFI_SSID_[234]|WIFI_PASSWORD_[234]|AP_SSID|AP_PASSWORD|PICO_SDK_PATH|PICO_TOOLCHAIN_PATH|PICO_BOARD|PICO_PLATFORM)
                 ENV_VALUES[$key]="$value"
                 ;;
             *)
@@ -181,11 +186,15 @@ WIFI_SSID="$(cfg WIFI_SSID)";     WIFI_PASSWORD="$(cfg WIFI_PASSWORD)"
 WIFI_SSID_2="$(cfg WIFI_SSID_2)"; WIFI_PASSWORD_2="$(cfg WIFI_PASSWORD_2)"
 WIFI_SSID_3="$(cfg WIFI_SSID_3)"; WIFI_PASSWORD_3="$(cfg WIFI_PASSWORD_3)"
 WIFI_SSID_4="$(cfg WIFI_SSID_4)"; WIFI_PASSWORD_4="$(cfg WIFI_PASSWORD_4)"
+AP_SSID="$(cfg AP_SSID)";         AP_PASSWORD="$(cfg AP_PASSWORD)"
+[[ -n "$AP_SSID" ]] || AP_SSID="epaper-setup"
+[[ -n "$AP_PASSWORD" ]] || AP_PASSWORD="epaper1234"
 BOARD="$(cfg_env PICO_BOARD pico_w)"
 PLATFORM="$(cfg_env PICO_PLATFORM rp2040)"
 
+# The Pico can always open its own access point, so no network at all is fine.
 if [[ -z "$WIFI_SSID$WIFI_SSID_2$WIFI_SSID_3$WIFI_SSID_4" ]]; then
-    die "No Wi-Fi network configured. Create .env with at least WIFI_SSID and WIFI_PASSWORD."
+    warn "No Wi-Fi network configured; the Pico will start its own access point \"$AP_SSID\"."
 fi
 
 # Show what will be compiled in (never the password itself) and catch typos early.
@@ -210,6 +219,13 @@ for i in 2 3 4; do
         warn "WIFI_PASSWORD_$i is set but WIFI_SSID_$i is empty; that entry is ignored"
     fi
 done
+
+# Fallback access point: CMake refuses values outside these limits, so say so here.
+ap_ssid_bytes="$(byte_length "$AP_SSID")"
+ap_pw_bytes="$(byte_length "$AP_PASSWORD")"
+(( ap_ssid_bytes >= 1 && ap_ssid_bytes <= 32 )) || die "AP_SSID must be 1 to 32 bytes, this one has $ap_ssid_bytes"
+(( ap_pw_bytes >= 8 && ap_pw_bytes <= 63 )) || die "AP_PASSWORD must be 8 to 63 bytes (WPA2), this one has $ap_pw_bytes"
+info "Fallback access point: \"$AP_SSID\"  (password: $ap_pw_bytes bytes), web UI at http://192.168.4.1/"
 
 # Old CMakeLists passed credentials as -D compile flags, which breaks on ; " and \.
 if ! grep -q 'wifi_config.h' "$ROOT/CMakeLists.txt" 2>/dev/null; then
@@ -311,6 +327,8 @@ run_step "Configure" "$BUILD_PATH/configure.log" \
         -DWIFI_PASSWORD_3="$WIFI_PASSWORD_3" \
         -DWIFI_SSID_4="$WIFI_SSID_4" \
         -DWIFI_PASSWORD_4="$WIFI_PASSWORD_4" \
+        -DAP_SSID="$AP_SSID" \
+        -DAP_PASSWORD="$AP_PASSWORD" \
         -DDISPLAY_TEXT="$INITIAL_TEXT" \
         -DDISPLAY_BG="$INITIAL_BG" \
         -DDISPLAY_ORIENTATION="$INITIAL_ORIENTATION" \
@@ -394,7 +412,7 @@ flash_with_bootsel() {
 if (( FORCE_BOOTSEL )) || ! flash_with_picotool; then
     flash_with_bootsel
 fi
-ok "Flashed. The board reboots on its own; it takes a moment to join Wi-Fi."
+ok "Flashed. The board reboots on its own; it takes a moment to join Wi-Fi (or open \"$AP_SSID\")."
 
 # ---- serial console --------------------------------------------------------------
 

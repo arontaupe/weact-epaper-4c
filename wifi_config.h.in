@@ -14,6 +14,10 @@
 #define WIFI_SSID_4 "@WIFI_SSID_4_C@"
 #define WIFI_PASSWORD_4 "@WIFI_PASSWORD_4_C@"
 
+/* Fallback access point, opened when none of the networks above can be joined. */
+#define AP_SSID "@AP_SSID_C@"
+#define AP_PASSWORD "@AP_PASSWORD_C@"
+
 #define DISPLAY_TEXT "@DISPLAY_TEXT_C@"
 #define DISPLAY_BG @DISPLAY_BG@
 #define DISPLAY_ORIENTATION @DISPLAY_ORIENTATION@
